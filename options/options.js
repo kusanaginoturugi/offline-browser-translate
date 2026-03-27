@@ -314,6 +314,10 @@ function autoSetFormatForModel(modelId) {
             updateVisibility();
             showToast('Automatically switched to TranslateGemma format');
         }
+        // TranslateGemma outputs plain text, not JSON — disable structured output
+        if (elements.useStructuredOutput.checked) {
+            elements.useStructuredOutput.checked = false;
+        }
     } else {
         // If switching away from TranslateGemma model and format is still TranslateGemma,
         // switch back to default

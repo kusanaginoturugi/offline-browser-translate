@@ -323,13 +323,18 @@ async function detectModelProvider(modelId, settings) {
     return model ? model.provider : null;
 }
 
+// Formats that produce plain text (not JSON) — never force JSON output for these
+const PLAIN_TEXT_FORMATS = new Set(['translategemma', 'hunyuan']);
+
 async function callOllama(settings, modelId, systemPrompt, userPrompt) {
     const body = {
         model: modelId,
         stream: false
     };
 
-    if (settings.useStructuredOutput) {
+    // Only request JSON format for formats that actually produce JSON
+    const isPlainTextFormat = PLAIN_TEXT_FORMATS.has(settings.requestFormat);
+    if (settings.useStructuredOutput && !isPlainTextFormat) {
         body.format = 'json';
     }
 
@@ -398,7 +403,9 @@ async function callLMStudio(settings, modelId, systemPrompt, userPrompt) {
         stream: false
     };
 
-    if (settings.useStructuredOutput) {
+    // Only request structured output for formats that produce JSON
+    const isPlainTextFormat = PLAIN_TEXT_FORMATS.has(settings.requestFormat);
+    if (settings.useStructuredOutput && !isPlainTextFormat) {
         body.response_format = TRANSLATION_SCHEMA;
     }
 

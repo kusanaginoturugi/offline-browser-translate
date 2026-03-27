@@ -278,6 +278,11 @@ function autoSetFormatForModel(modelId) {
             elements.customPrompts.hidden = true;
             showToast('Switched to TranslateGemma format');
         }
+        // TranslateGemma outputs plain text, not JSON — disable structured output
+        if (currentSettings.useStructuredOutput) {
+            currentSettings.useStructuredOutput = false;
+            elements.useStructuredOutput.checked = false;
+        }
     } else {
         // If switching away from TranslateGemma model and format is still TranslateGemma,
         // switch back to default
@@ -291,6 +296,8 @@ function autoSetFormatForModel(modelId) {
 }
 
 // Check which providers are available
+let providersAvailable = false;
+
 async function checkProviders() {
     const statusWrapper = elements.providerStatus;
     const statusDot = statusWrapper.querySelector('.status-dot');
@@ -305,14 +312,99 @@ async function checkProviders() {
         if (providers.length > 0) {
             statusDot.className = 'status-dot connected';
             statusWrapper.title = `Connected: ${providers.join(', ')}`;
+            providersAvailable = true;
+            hideSetupBanner();
         } else {
             statusDot.className = 'status-dot error';
             statusWrapper.title = 'No providers found';
+            providersAvailable = false;
+            showSetupBanner();
         }
     } catch (e) {
         statusDot.className = 'status-dot error';
         statusWrapper.title = 'Error checking providers';
+        providersAvailable = false;
+        showSetupBanner();
     }
+}
+
+// Show/hide first-run setup guidance banner
+function showSetupBanner(type = 'no-provider') {
+    let banner = document.getElementById('setup-banner');
+    if (banner) {
+        banner.hidden = false;
+        // Update content if it already exists
+        if (type === 'no-models') {
+            banner.innerHTML = `
+                <div style="font-weight: bold; margin-bottom: 4px; color: var(--yellow, #dbbc7f);">⚠️ No translation models found</div>
+                <div>Your LLM provider is connected, but you haven't downloaded a translation model yet.</div>
+                <div style="margin-top: 6px;">Recommended model:</div>
+                <div style="background: var(--bg1, #2b2b2b); padding: 4px 8px; border-radius: 4px; font-family: monospace; display: flex; align-items: center; justify-content: space-between; margin-top: 4px;">
+                    <code>ollama pull translategemma2</code>
+                </div>
+                <div style="margin-top: 6px; font-size: 11px; opacity: 0.8;">Or download a model in LMStudio (search for "translate"). Click ↻ above when done.</div>
+            `;
+        } else {
+            banner.innerHTML = `
+                <div style="font-weight: bold; margin-bottom: 4px; color: var(--yellow, #dbbc7f);">⚠️ No LLM provider detected</div>
+                <div>To use this extension, you need a local LLM server running:</div>
+                <ol style="margin: 6px 0 2px 18px; padding: 0;">
+                    <li>Install <a href="https://ollama.com" target="_blank" style="color: var(--accent, #a7c080);">Ollama</a> or <a href="https://lmstudio.ai" target="_blank" style="color: var(--accent, #a7c080);">LMStudio</a></li>
+                    <li>Load a translation model (e.g. <code style="background: var(--bg1, #2b2b2b); padding: 1px 4px; border-radius: 3px;">ollama pull translategemma2</code>)</li>
+                    <li>Click the refresh button ↻ above</li>
+                </ol>
+            `;
+        }
+        return;
+    }
+
+    banner = document.createElement('div');
+    banner.id = 'setup-banner';
+    banner.style.cssText = `
+        background: var(--bg3, #3a3a3a);
+        border: 1px solid var(--yellow, #dbbc7f);
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin: 8px 0;
+        font-size: 12px;
+        line-height: 1.5;
+        color: var(--fg, #d3c6aa);
+    `;
+    
+    if (type === 'no-models') {
+        banner.innerHTML = `
+            <div style="font-weight: bold; margin-bottom: 4px; color: var(--yellow, #dbbc7f);">⚠️ No translation models found</div>
+            <div>Your LLM provider is connected, but you haven't downloaded a translation model yet.</div>
+            <div style="margin-top: 6px;">Recommended model:</div>
+            <div style="background: var(--bg1, #2b2b2b); padding: 4px 8px; border-radius: 4px; font-family: monospace; display: flex; align-items: center; justify-content: space-between; margin-top: 4px;">
+                <code>ollama pull translategemma2</code>
+            </div>
+            <div style="margin-top: 6px; font-size: 11px; opacity: 0.8;">Or download a model in LMStudio (search for "translate"). Click ↻ above when done.</div>
+        `;
+    } else {
+        banner.innerHTML = `
+            <div style="font-weight: bold; margin-bottom: 4px; color: var(--yellow, #dbbc7f);">⚠️ No LLM provider detected</div>
+            <div>To use this extension, you need a local LLM server running:</div>
+            <ol style="margin: 6px 0 2px 18px; padding: 0;">
+                <li>Install <a href="https://ollama.com" target="_blank" style="color: var(--accent, #a7c080);">Ollama</a> or <a href="https://lmstudio.ai" target="_blank" style="color: var(--accent, #a7c080);">LMStudio</a></li>
+                <li>Load a translation model (e.g. <code style="background: var(--bg1, #2b2b2b); padding: 1px 4px; border-radius: 3px;">ollama pull translategemma2</code>)</li>
+                <li>Click the refresh button ↻ above</li>
+            </ol>
+        `;
+    }
+
+    // Insert after the model selector row
+    const modelRow = elements.modelSelect?.closest('.row') || elements.modelSelect?.parentElement;
+    if (modelRow) {
+        modelRow.parentNode.insertBefore(banner, modelRow.nextSibling);
+    } else {
+        document.querySelector('.popup-body, .container, body')?.prepend(banner);
+    }
+}
+
+function hideSetupBanner() {
+    const banner = document.getElementById('setup-banner');
+    if (banner) banner.hidden = true;
 }
 
 // Load available models
@@ -326,8 +418,14 @@ async function loadModels(forceRefresh = false) {
 
         if (models.length === 0) {
             elements.modelSelect.innerHTML = '<option value="">No models found</option>';
+            if (providersAvailable) {
+                showSetupBanner('no-models');
+            }
             return;
         }
+
+        // We have models, hide banner if it's the "no-models" type (or any type)
+        hideSetupBanner();
 
         elements.modelSelect.innerHTML = '';
         models.forEach(m => {
@@ -389,9 +487,15 @@ async function saveCurrentSettings() {
 async function startTranslation() {
     if (isTranslating) return;
 
+    // --- Pre-flight checks with clear error messages ---
     const model = elements.modelSelect.value;
     if (!model) {
         showToast('Please select a model first', 'error');
+        return;
+    }
+
+    if (!providersAvailable) {
+        showToast('No LLM provider running. Start Ollama or LMStudio first.', 'error');
         return;
     }
 
@@ -412,17 +516,38 @@ async function startTranslation() {
             throw new Error('No active tab found');
         }
 
+        // Check if page is a restricted URL
+        if (tab.url && (tab.url.startsWith('about:') || tab.url.startsWith('chrome:') ||
+            tab.url.startsWith('moz-extension:') || tab.url.startsWith('chrome-extension:'))) {
+            throw new Error('Cannot translate browser internal pages.');
+        }
+
         // Try to inject content script
         try {
             await browserAPI.scripting.executeScript({
                 target: { tabId: tab.id },
                 files: ['/content.js']
             });
-            // Give it a moment to initialize
-            await new Promise(resolve => setTimeout(resolve, 100));
         } catch (injectErr) {
             console.log('Script injection note:', injectErr.message);
             // May already be injected or page doesn't allow scripts
+        }
+
+        // Wait for content script readiness (replaces fragile 100ms delay)
+        let scriptReady = false;
+        for (let i = 0; i < 15; i++) {
+            try {
+                const resp = await browserAPI.tabs.sendMessage(tab.id, { type: 'PING' });
+                if (resp && resp.pong) {
+                    scriptReady = true;
+                    break;
+                }
+            } catch { }
+            await new Promise(r => setTimeout(r, 100));
+        }
+
+        if (!scriptReady) {
+            throw new Error('Could not connect to page. Try refreshing the page first.');
         }
 
         // Resolve source language: if auto, use the detected language we found earlier
@@ -431,30 +556,21 @@ async function startTranslation() {
             finalSourceLang = detectedPageLanguage;
         }
 
-        // Try to send message with retry
-        let lastError = null;
-        for (let attempt = 0; attempt < 3; attempt++) {
-            try {
-                const response = await browserAPI.tabs.sendMessage(tab.id, {
-                    type: 'START_TRANSLATION',
-                    targetLanguage: currentSettings.targetLanguage,
-                    sourceLanguage: finalSourceLang, // Add source language for logging and override
-                    showGlow: currentSettings.showGlow,
-                    maxConcurrentRequests: currentSettings.maxConcurrentRequests || 4
-                });
-                if (response && response.started) {
-                    return; // Success! UI stays in translating state
-                }
-            } catch (msgErr) {
-                lastError = msgErr;
-                console.log(`Attempt ${attempt + 1} failed:`, msgErr.message);
-                // Wait before retry
-                await new Promise(resolve => setTimeout(resolve, 200));
+        // Send translation message (script is confirmed ready)
+        try {
+            const response = await browserAPI.tabs.sendMessage(tab.id, {
+                type: 'START_TRANSLATION',
+                targetLanguage: currentSettings.targetLanguage,
+                sourceLanguage: finalSourceLang,
+                showGlow: currentSettings.showGlow,
+                maxConcurrentRequests: currentSettings.maxConcurrentRequests || 4
+            });
+            if (response && response.started) {
+                return; // Success! UI stays in translating state
             }
+        } catch (msgErr) {
+            throw new Error('Lost connection to page. Please refresh and try again.');
         }
-
-        // If we get here, all attempts failed
-        throw new Error('Could not connect to page. Please refresh the page and try again.');
 
     } catch (e) {
         console.error('Translation error:', e);

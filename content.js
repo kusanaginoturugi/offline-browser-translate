@@ -933,6 +933,10 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
             });
             break;
 
+        case 'PING':
+            sendResponse({ pong: true });
+            break;
+
         default:
             sendResponse({ unknown: true });
     }
