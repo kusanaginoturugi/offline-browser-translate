@@ -88,6 +88,7 @@ const elements = {
     useStructuredOutput: document.getElementById('useStructuredOutput'),
     showGlow: document.getElementById('showGlow'),
     debugLogging: document.getElementById('debugLogging'),
+    floatingButton: document.getElementById('floatingButton'),
     customPromptsSection: document.getElementById('customPromptsSection'),
     customSystem: document.getElementById('customSystem'),
     customUser: document.getElementById('customUser'),
@@ -262,6 +263,7 @@ function applySettingsToUI() {
     elements.useStructuredOutput.checked = currentSettings.useStructuredOutput;
     elements.showGlow.checked = currentSettings.showGlow !== false;
     elements.debugLogging.checked = !!currentSettings.debug;
+    elements.floatingButton.checked = !!currentSettings.floatingButton;
     elements.customSystem.value = currentSettings.customSystemPrompt || '';
     elements.customUser.value = currentSettings.customUserPromptTemplate || '';
 
@@ -368,6 +370,7 @@ async function saveCurrentSettings() {
         useStructuredOutput: elements.useStructuredOutput.checked,
         showGlow: elements.showGlow.checked,
         debug: elements.debugLogging.checked,
+        floatingButton: elements.floatingButton.checked,
         // Save custom prompts from the new prompt editor
         customSystemPrompt: elements.systemPrompt?.value || elements.customSystem?.value || '',
         customUserPromptTemplate: elements.userPrompt?.value || elements.customUser?.value || '',
@@ -476,3 +479,55 @@ function setupEventListeners() {
 
 // Initialize on DOM ready
 document.addEventListener('DOMContentLoaded', init);
+
+// ============================================================================
+// Floating button permission management
+// ============================================================================
+
+async function enableFloatingButton() {
+    const granted = await browserAPI.permissions.request({ origins: ['<all_urls>'] });
+    if (!granted) {
+        elements.floatingButton.checked = false;
+        showToast('Permission denied — floating button not enabled', 'error');
+        return false;
+    }
+    try {
+        await browserAPI.scripting.registerContentScripts([{
+            id: 'llm-translator-content',
+            matches: ['http://*/*', 'https://*/*'],
+            js: ['content.js'],
+            runAt: 'document_idle'
+        }]);
+    } catch (e) {
+        // Already registered from a previous enable
+    }
+    return true;
+}
+
+async function disableFloatingButton() {
+    try {
+        await browserAPI.scripting.unregisterContentScripts({ ids: ['llm-translator-content'] });
+    } catch (e) {
+        // Not registered, nothing to do
+    }
+    try {
+        await browserAPI.permissions.remove({ origins: ['<all_urls>'] });
+    } catch (e) {
+        // Permission may already be absent
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    elements.floatingButton.addEventListener('change', async (e) => {
+        if (e.target.checked) {
+            const ok = await enableFloatingButton();
+            if (ok) showToast('Floating button enabled — reload pages to activate');
+        } else {
+            await disableFloatingButton();
+            showToast('Floating button disabled');
+        }
+        // Persist the setting immediately without waiting for Save
+        currentSettings.floatingButton = elements.floatingButton.checked;
+        await browserAPI.runtime.sendMessage({ type: 'SAVE_SETTINGS', settings: currentSettings });
+    });
+});

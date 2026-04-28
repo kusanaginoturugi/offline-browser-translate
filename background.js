@@ -33,8 +33,9 @@ const DEFAULT_SETTINGS = {
     temperature: 0.3,
     useStructuredOutput: true,
     showGlow: false,
-    numCtx: 0,    // Ollama context window size (0 = model default)
-    debug: false  // Enable verbose logging
+    numCtx: 0,          // Ollama context window size (0 = model default)
+    debug: false,       // Enable verbose logging
+    floatingButton: false // Show floating translate button on text selection (requires <all_urls> permission)
 };
 
 let debugEnabled = false;
@@ -627,7 +628,7 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Context Menu
 // ============================================================================
 
-browserAPI.runtime.onInstalled.addListener(() => {
+browserAPI.runtime.onInstalled.addListener(async () => {
     browserAPI.contextMenus.create({
         id: "translate-page",
         title: "Translate Page",
@@ -639,6 +640,22 @@ browserAPI.runtime.onInstalled.addListener(() => {
         title: "Translate Selection",
         contexts: ["selection"]
     }, () => { if (browserAPI.runtime.lastError) {} });
+
+    // Re-register content script auto-injection if the user had the floating button enabled.
+    // registerContentScripts() registrations are cleared on extension update/reinstall.
+    const settings = await getSettings();
+    if (settings.floatingButton) {
+        try {
+            await browserAPI.scripting.registerContentScripts([{
+                id: 'llm-translator-content',
+                matches: ['http://*/*', 'https://*/*'],
+                js: ['content.js'],
+                runAt: 'document_idle'
+            }]);
+        } catch (e) {
+            // Already registered (e.g. fresh install where registration survived)
+        }
+    }
 });
 
 browserAPI.contextMenus.onClicked.addListener(async (info, tab) => {

@@ -968,6 +968,9 @@ async function translateSelection(targetLanguage, sourceLanguage = 'auto') {
         stopKeepAlive();
         translationInProgress = false;
         translationCancelled = false;
+        // Suppress the button briefly so it doesn't reappear on the now-translated selection
+        suppressFloatingBtn = true;
+        setTimeout(() => { suppressFloatingBtn = false; }, 1000);
     }
 }
 
@@ -1090,3 +1093,87 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 console.log('Local LLM Translator content script loaded');
+
+// ============================================================================
+// Floating translate button (only active when auto-injected via optional permission)
+// ============================================================================
+
+let floatingTranslateBtn = null;
+let selectionChangeTimer = null;
+let suppressFloatingBtn = false;
+
+function getFloatingTranslateBtn() {
+    if (floatingTranslateBtn) return floatingTranslateBtn;
+
+    const btn = document.createElement('div');
+    btn.id = 'llm-translator-float-btn';
+    btn.title = 'Translate Selection';
+    btn.style.cssText = [
+        'position:absolute', 'width:28px', 'height:28px', 'cursor:pointer',
+        'z-index:999999', 'border-radius:6px', 'background-color:#A7C080',
+        'box-shadow:0 2px 8px rgba(0,0,0,0.2)', 'display:none',
+        'align-items:center', 'justify-content:center',
+        'transition:opacity 0.15s,transform 0.15s', 'opacity:0', 'transform:scale(0.8)'
+    ].join(';');
+
+    const img = document.createElement('img');
+    img.src = browserAPI.runtime.getURL('icons/icon16.png');
+    img.style.cssText = 'width:16px;height:16px;pointer-events:none';
+    btn.appendChild(img);
+
+    btn.addEventListener('mousedown', (e) => { e.preventDefault(); e.stopPropagation(); });
+    btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        hideFloatingBtn();
+        // currentTargetLanguage is set by the last START_TRANSLATION / TRANSLATE_SELECTION message,
+        // or stays 'en' as the default. Source language is read from the page.
+        translateSelection(currentTargetLanguage, getPageLanguage());
+    });
+
+    document.body.appendChild(btn);
+    floatingTranslateBtn = btn;
+    return btn;
+}
+
+function showFloatingBtn(selection) {
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+    const range = selection.getRangeAt(selection.rangeCount - 1);
+    const rects = range.getClientRects();
+    const rect = rects.length > 0 ? rects[rects.length - 1] : range.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return;
+
+    const btn = getFloatingTranslateBtn();
+    btn.style.left = (rect.right + window.scrollX + 4) + 'px';
+    btn.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+    btn.style.display = 'flex';
+    requestAnimationFrame(() => { btn.style.opacity = '1'; btn.style.transform = 'scale(1)'; });
+}
+
+function hideFloatingBtn() {
+    if (!floatingTranslateBtn) return;
+    floatingTranslateBtn.style.opacity = '0';
+    floatingTranslateBtn.style.transform = 'scale(0.8)';
+    setTimeout(() => { if (floatingTranslateBtn) floatingTranslateBtn.style.display = 'none'; }, 150);
+}
+
+// Attach selection listeners unconditionally — the floating button only shows when text is
+// selected and no translation is in progress. When content.js is manually injected by the
+// popup (full-page translate), translationInProgress will be true and the button stays hidden.
+document.addEventListener('selectionchange', () => {
+    if (selectionChangeTimer) clearTimeout(selectionChangeTimer);
+    selectionChangeTimer = setTimeout(() => {
+        const selection = window.getSelection();
+        const selectedText = selection?.toString().trim() || '';
+        if (selection && !selection.isCollapsed && selectedText.length >= MIN_TEXT_LENGTH) {
+            if (!translationInProgress && !suppressFloatingBtn) showFloatingBtn(selection);
+            else hideFloatingBtn();
+        } else {
+            hideFloatingBtn();
+        }
+    }, 300);
+});
+
+window.addEventListener('scroll', () => {
+    if (floatingTranslateBtn && floatingTranslateBtn.style.display !== 'none') hideFloatingBtn();
+}, { passive: true });
