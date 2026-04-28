@@ -592,6 +592,29 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     sendResponse({ models });
                     break;
 
+                case 'REGISTER_CONTENT_SCRIPT':
+                    try {
+                        await browserAPI.scripting.registerContentScripts([{
+                            id: 'llm-translator-content',
+                            matches: ['http://*/*', 'https://*/*'],
+                            js: ['content.js'],
+                            runAt: 'document_idle'
+                        }]);
+                    } catch (e) {
+                        // Already registered — not an error
+                    }
+                    sendResponse({ ok: true });
+                    break;
+
+                case 'UNREGISTER_CONTENT_SCRIPT':
+                    try {
+                        await browserAPI.scripting.unregisterContentScripts({ ids: ['llm-translator-content'] });
+                    } catch (e) {
+                        // Not registered — not an error
+                    }
+                    sendResponse({ ok: true });
+                    break;
+
                 case 'TRANSLATE':
                     // Pass sourceLanguage for TranslateGemma support
                     const settingsWithSource = {

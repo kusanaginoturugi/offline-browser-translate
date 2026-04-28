@@ -491,25 +491,13 @@ async function enableFloatingButton() {
         showToast('Permission denied — floating button not enabled', 'error');
         return false;
     }
-    try {
-        await browserAPI.scripting.registerContentScripts([{
-            id: 'llm-translator-content',
-            matches: ['http://*/*', 'https://*/*'],
-            js: ['content.js'],
-            runAt: 'document_idle'
-        }]);
-    } catch (e) {
-        // Already registered from a previous enable
-    }
+    // Delegate registration to background so the path resolves from the extension root
+    await browserAPI.runtime.sendMessage({ type: 'REGISTER_CONTENT_SCRIPT' });
     return true;
 }
 
 async function disableFloatingButton() {
-    try {
-        await browserAPI.scripting.unregisterContentScripts({ ids: ['llm-translator-content'] });
-    } catch (e) {
-        // Not registered, nothing to do
-    }
+    await browserAPI.runtime.sendMessage({ type: 'UNREGISTER_CONTENT_SCRIPT' });
     try {
         await browserAPI.permissions.remove({ origins: ['<all_urls>'] });
     } catch (e) {
