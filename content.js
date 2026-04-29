@@ -956,13 +956,30 @@ async function translateSelection(targetLanguage, sourceLanguage = 'auto') {
 
         let totalApplied = 0;
         const batchSize = 8;
+        const failedItems = [];
 
         for (let i = 0; i < textItems.length && !translationCancelled; i += batchSize) {
             const batch = textItems.slice(i, i + batchSize);
             const result = await translateBatch(batch, targetLanguage, sourceLanguage);
             totalApplied += result.applied;
+            if (result.failed && result.failed.length > 0) failedItems.push(...result.failed);
             const percent = Math.min(100, Math.round(((i + batch.length) / textItems.length) * 100));
             showStatus(`Translating selection... ${percent}%`);
+        }
+
+        // Retry failed items (up to 2 attempts, smaller batches)
+        let retryAttempts = 0;
+        const maxRetries = 2;
+        while (failedItems.length > 0 && retryAttempts < maxRetries && !translationCancelled) {
+            retryAttempts++;
+            await new Promise(r => setTimeout(r, 500 * retryAttempts));
+            const itemsToRetry = failedItems.splice(0, failedItems.length);
+            for (let i = 0; i < itemsToRetry.length && !translationCancelled; i += 4) {
+                const batch = itemsToRetry.slice(i, i + 4);
+                const result = await translateBatch(batch, targetLanguage, sourceLanguage, 1);
+                totalApplied += result.applied;
+                if (result.failed && result.failed.length > 0) failedItems.push(...result.failed);
+            }
         }
 
         if (totalApplied > 0) {
@@ -970,7 +987,9 @@ async function translateSelection(targetLanguage, sourceLanguage = 'auto') {
             isShowingTranslations = true;
         }
 
-        showStatus(`Translated ${totalApplied}/${textItems.length} selected elements`);
+        let statusMsg = `Translated ${totalApplied}/${textItems.length} selected elements`;
+        if (failedItems.length > 0) statusMsg += ` - ${failedItems.length} failed`;
+        showStatus(statusMsg);
         setTimeout(hideStatus, 4000);
 
     } catch (e) {
@@ -1112,7 +1131,6 @@ console.log('Local LLM Translator content script loaded');
 // ============================================================================
 
 let floatingTranslateBtn = null;
-let selectionChangeTimer = null;
 let suppressFloatingBtn = false;
 
 function getLanguageName(code) {
@@ -1182,24 +1200,30 @@ function hideFloatingBtn() {
     setTimeout(() => { if (floatingTranslateBtn) floatingTranslateBtn.style.display = 'none'; }, 80);
 }
 
-// Hide immediately when selection is cleared; debounce only the show to avoid flicker during drag.
+function tryShowFloatingBtn() {
+    const selection = window.getSelection();
+    const selectedText = selection?.toString().trim() || '';
+    const sameLanguage = getPageLanguage() === currentTargetLanguage;
+    if (selection && !selection.isCollapsed && selectedText.length >= MIN_TEXT_LENGTH
+            && !sameLanguage && !translationInProgress && !suppressFloatingBtn) {
+        showFloatingBtn(selection);
+    }
+}
+
+// mouseup/keyup: selection is final, safe to show the button.
+// selectionchange: only used to hide when selection is cleared, avoiding
+// the double-click problem where it briefly collapses before expanding.
+document.addEventListener('mouseup', tryShowFloatingBtn);
+document.addEventListener('keyup', (e) => {
+    if (e.shiftKey || e.key === 'End' || e.key === 'Home') tryShowFloatingBtn();
+});
+
 document.addEventListener('selectionchange', () => {
     const selection = window.getSelection();
     const selectedText = selection?.toString().trim() || '';
-
     if (!selection || selection.isCollapsed || selectedText.length < MIN_TEXT_LENGTH) {
-        if (selectionChangeTimer) { clearTimeout(selectionChangeTimer); selectionChangeTimer = null; }
         hideFloatingBtn();
-        return;
     }
-
-    if (selectionChangeTimer) clearTimeout(selectionChangeTimer);
-    selectionChangeTimer = setTimeout(() => {
-        const sameLanguage = getPageLanguage() === currentTargetLanguage;
-        if (!sameLanguage && !translationInProgress && !suppressFloatingBtn) {
-            showFloatingBtn(window.getSelection());
-        }
-    }, 200);
 });
 
 window.addEventListener('scroll', () => {
