@@ -49,6 +49,7 @@ const elements = {
     formatDescription: document.getElementById('formatDescription'),
     useStructuredOutput: document.getElementById('useStructuredOutput'),
     showGlow: document.getElementById('showGlow'),
+    floatingButton: document.getElementById('floatingButton'),
     customPrompts: document.getElementById('customPrompts'),
     customSystem: document.getElementById('customSystem'),
     customUser: document.getElementById('customUser'),
@@ -234,6 +235,7 @@ function applySettingsToUI() {
     elements.requestFormat.value = currentSettings.requestFormat;
     elements.useStructuredOutput.checked = currentSettings.useStructuredOutput;
     elements.showGlow.checked = currentSettings.showGlow !== false;
+    if (elements.floatingButton) elements.floatingButton.checked = !!currentSettings.floatingButton;
     elements.customSystem.value = currentSettings.customSystemPrompt || '';
     elements.customUser.value = currentSettings.customUserPromptTemplate || '';
 
@@ -644,6 +646,28 @@ function setupEventListeners() {
         elements.advancedSection.hidden = !isHidden;
         elements.toggleAdvanced.classList.toggle('active', !isHidden);
     });
+
+    // Floating button toggle — permission required to enable
+    if (elements.floatingButton) {
+        elements.floatingButton.addEventListener('change', async (e) => {
+            if (e.target.checked) {
+                const granted = await browserAPI.permissions.request({ origins: ['<all_urls>'] });
+                if (!granted) {
+                    e.target.checked = false;
+                    showToast('Permission denied', 'error');
+                    return;
+                }
+                await browserAPI.runtime.sendMessage({ type: 'REGISTER_CONTENT_SCRIPT' });
+                showToast('Floating button enabled — reload pages to activate');
+            } else {
+                await browserAPI.runtime.sendMessage({ type: 'UNREGISTER_CONTENT_SCRIPT' });
+                try { await browserAPI.permissions.remove({ origins: ['<all_urls>'] }); } catch (e) {}
+                showToast('Floating button disabled — permission removed');
+            }
+            currentSettings.floatingButton = e.target.checked;
+            await browserAPI.runtime.sendMessage({ type: 'SAVE_SETTINGS', settings: currentSettings });
+        });
+    }
 
     // Temperature slider
     elements.temperature.addEventListener('input', (e) => {

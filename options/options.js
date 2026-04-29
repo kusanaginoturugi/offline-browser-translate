@@ -512,7 +512,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (ok) showToast('Floating button enabled — reload pages to activate');
         } else {
             await disableFloatingButton();
-            showToast('Floating button disabled');
+            showToast('Floating button disabled — permission removed');
         }
         // Persist the setting immediately without waiting for Save
         currentSettings.floatingButton = elements.floatingButton.checked;
