@@ -350,6 +350,38 @@ function parseTranslationResponse(response, originalItems) {
     return translations;
 }
 
+async function autoDetectAndSelectModel() {
+    try {
+        const settings = await getSettings();
+        if (settings.selectedModel) return null; // already configured
+
+        const models = await listModels(settings, false); // force fresh fetch
+        if (models.length === 0) return null;
+
+        // Prefer TranslateGemma if loaded, otherwise take the first available model
+        const preferred = models.find(m =>
+            m.id.toLowerCase().includes('translategemma') ||
+            m.id.toLowerCase().includes('translate-gemma')
+        ) || models[0];
+
+        const updates = {
+            selectedModel: preferred.id,
+            provider: preferred.provider
+        };
+
+        const isTranslateGemma = preferred.id.toLowerCase().includes('translategemma') ||
+            preferred.id.toLowerCase().includes('translate-gemma');
+        if (isTranslateGemma) updates.requestFormat = 'translategemma';
+
+        await saveSettings(updates);
+        console.log(`[Background] Auto-selected model: ${preferred.id} (${preferred.provider})`);
+        return preferred;
+    } catch (e) {
+        console.warn('[Background] Auto model detection failed:', e.message);
+        return null;
+    }
+}
+
 async function detectModelProvider(modelId, settings) {
     // Use cached models to avoid extra API calls
     const models = await listModels(settings, true);
@@ -617,7 +649,7 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
                 case 'TRANSLATE':
                     // Pass sourceLanguage for TranslateGemma support
-                    const settingsWithSource = {
+                    let settingsWithSource = {
                         ...settings,
                         sourceLanguage: message.sourceLanguage || settings.sourceLanguage || 'en'
                     };
@@ -625,6 +657,18 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     // WARNING LOG: Check if source language is missing or 'auto'
                     if (!settingsWithSource.sourceLanguage || settingsWithSource.sourceLanguage === 'auto') {
                         console.warn('[Background] WARNING: Source language is "auto" or missing. Some models (like TranslateGemma) require a specific source language code to function correctly.');
+                    }
+
+                    // Auto-detect model if none selected (e.g. fresh install, providers not ready at install time)
+                    if (!settingsWithSource.selectedModel) {
+                        await autoDetectAndSelectModel();
+                        const refreshed = await getSettings();
+                        settingsWithSource = {
+                            ...settingsWithSource,
+                            selectedModel: refreshed.selectedModel,
+                            provider: refreshed.provider,
+                            requestFormat: refreshed.requestFormat
+                        };
                     }
 
                     const translations = await translate(
@@ -663,6 +707,9 @@ browserAPI.runtime.onInstalled.addListener(async () => {
         title: "Translate Selection",
         contexts: ["selection"]
     }, () => { if (browserAPI.runtime.lastError) {} });
+
+    // Auto-detect and select a model on fresh install (when none is configured yet)
+    await autoDetectAndSelectModel();
 
     // Re-register content script auto-injection if the user had the floating button enabled.
     // registerContentScripts() registrations are cleared on extension update/reinstall.

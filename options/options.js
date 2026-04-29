@@ -316,7 +316,7 @@ function autoSetFormatForModel(modelId) {
             elements.requestFormat.value = 'translategemma';
             updateFormatDescription('translategemma');
             updateVisibility();
-            showToast('Automatically switched to TranslateGemma format');
+            showToast('Automatically switched to TranslateGemma format', 'success', 1500);
         }
         // TranslateGemma outputs plain text, not JSON — disable structured output
         if (elements.useStructuredOutput.checked) {
@@ -384,7 +384,7 @@ async function saveCurrentSettings() {
 }
 
 // Show toast notification
-function showToast(message, type = 'success') {
+function showToast(message, type = 'success', duration = 3000) {
     const toast = elements.toast;
     const icon = toast.querySelector('.toast-icon');
     const msg = toast.querySelector('.toast-message');
@@ -395,7 +395,7 @@ function showToast(message, type = 'success') {
     toast.classList.add('show');
     setTimeout(() => {
         toast.classList.remove('show');
-    }, 3000);
+    }, duration);
 }
 
 // Setup event listeners
