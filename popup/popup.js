@@ -5,23 +5,29 @@
 // Use browser API with chrome fallback for Firefox compatibility
 const browserAPI = typeof browser !== 'undefined' ? browser : chrome;
 
-// Import default settings
+// Import default settings (kept in sync with background.js DEFAULT_SETTINGS)
 const DEFAULT_SETTINGS = {
     provider: 'auto',
     ollamaUrl: 'http://localhost:11434',
     lmstudioUrl: 'http://localhost:1234',
     selectedModel: '',
     targetLanguage: 'en',
+    sourceLanguage: 'auto',
     maxTokensPerBatch: 2000,
     maxItemsPerBatch: 8,
     maxConcurrentRequests: 4, // 1-4 parallel requests (LMStudio 0.4.0+ supports parallelism)
     useAdvanced: false,
     customSystemPrompt: '',
     customUserPromptTemplate: '',
-    requestFormat: 'default',
+    requestFormat: 'auto',
     temperature: 0.3,
     useStructuredOutput: true,
-    showGlow: true
+    maxOutputRetries: 2,
+    plainTextFallback: true,
+    showGlow: true,
+    numCtx: 0,
+    debug: false,
+    floatingButton: false
 };
 
 // DOM Elements
@@ -61,6 +67,7 @@ const elements = {
 
 // Format descriptions for each request format type
 const FORMAT_DESCRIPTIONS = {
+    auto: 'Picks the right format automatically based on the selected model.',
     default: 'Standard JSON output format. Best for most models. Returns translations as a structured JSON array.',
     translategemma: 'Specialized format for TranslateGemma models. Uses the exact prompt structure required by TranslateGemma. Auto-detects source language from the page.',
     hunyuan: 'Format optimized for Hunyuan-MT models. Minimal prompt with no system message.',
@@ -131,13 +138,6 @@ function populateSourceLangOverride() {
     }
 }
 
-// Show/hide source language group (Always show now per user request)
-function updateSourceLangVisibility() {
-    if (!elements.sourceLangGroup) return;
-    // Always show source language options so user can see detection status
-    elements.sourceLangGroup.hidden = false;
-}
-
 // Show toast notification
 function showToast(message, type = 'success', duration = 3000) {
     const toast = elements.toast;
@@ -167,7 +167,6 @@ async function init() {
     populateSourceLangOverride();
     await loadSettings();
     applySettingsToUI();
-    updateSourceLangVisibility();
     await checkProviders();
     await loadModels();
     setupEventListeners();
@@ -244,58 +243,36 @@ function applySettingsToUI() {
         elements.sourceLangOverride.value = currentSettings.sourceLanguage;
     }
 
-    // Show custom prompts if custom format selected
-    elements.customPrompts.hidden = currentSettings.requestFormat !== 'custom';
-
-    // Update format description
-    updateFormatDescription(currentSettings.requestFormat);
+    // Refresh format-dependent UI
+    updateFormatUI();
 }
 
-// Update format description text
-function updateFormatDescription(format) {
-    if (elements.formatDescription) {
-        elements.formatDescription.textContent = FORMAT_DESCRIPTIONS[format] || '';
+// The effective format = the explicit choice, or (for 'auto') the one detected
+// from the selected model. detectRequestFormat/PLAIN_TEXT_FORMATS come from languages.js.
+function getEffectiveFormat() {
+    return resolveRequestFormat(
+        { requestFormat: elements.requestFormat.value },
+        elements.modelSelect.value
+    );
+}
+
+// Refresh format-dependent UI. Non-mutating: it never silently rewrites the
+// user's format choice — 'auto' resolves at translation time in the background.
+function updateFormatUI() {
+    const fmt = elements.requestFormat.value;
+    const effective = getEffectiveFormat();
+
+    let desc = FORMAT_DESCRIPTIONS[fmt] || '';
+    if (fmt === 'auto' && elements.modelSelect.value) {
+        desc += ` Detected for this model: ${effective}.`;
     }
-}
+    if (elements.formatDescription) elements.formatDescription.textContent = desc;
 
-// Check if a model is a TranslateGemma model
-function isTranslateGemmaModel(modelId) {
-    if (!modelId) return false;
-    const lowerName = modelId.toLowerCase();
-    return lowerName.includes('translategemma') ||
-        lowerName.includes('translate-gemma') ||
-        lowerName.includes('translate_gemma');
-}
+    // Structured JSON output is meaningless for plain-text formats; grey it out.
+    // (The background already ignores it for those, so we don't touch its value.)
+    elements.useStructuredOutput.disabled = PLAIN_TEXT_FORMATS.has(effective);
 
-// Automatically set format based on model type
-function autoSetFormatForModel(modelId) {
-    if (!modelId) return;
-
-    const isTranslateGemma = isTranslateGemmaModel(modelId);
-
-    if (isTranslateGemma) {
-        if (currentSettings.requestFormat !== 'translategemma') {
-            elements.requestFormat.value = 'translategemma';
-            currentSettings.requestFormat = 'translategemma';
-            updateFormatDescription('translategemma');
-            elements.customPrompts.hidden = true;
-            showToast('Switched to TranslateGemma format', 'success', 1500);
-        }
-        // TranslateGemma outputs plain text, not JSON — disable structured output
-        if (currentSettings.useStructuredOutput) {
-            currentSettings.useStructuredOutput = false;
-            elements.useStructuredOutput.checked = false;
-        }
-    } else {
-        // If switching away from TranslateGemma model and format is still TranslateGemma,
-        // switch back to default
-        if (currentSettings.requestFormat === 'translategemma') {
-            elements.requestFormat.value = 'default';
-            currentSettings.requestFormat = 'default';
-            updateFormatDescription('default');
-            elements.customPrompts.hidden = true;
-        }
-    }
+    elements.customPrompts.hidden = fmt !== 'custom';
 }
 
 // Check which providers are available
@@ -307,21 +284,54 @@ async function checkProviders() {
 
     try {
         const response = await browserAPI.runtime.sendMessage({ type: 'DETECT_PROVIDERS' });
+        
+        // Resolve active provider using setting or currently selected model's provider
+        const providerSetting = currentSettings.provider; // 'auto', 'ollama', 'lmstudio'
+        const selectedOption = elements.modelSelect.selectedOptions[0];
+        const selectedModelProvider = selectedOption ? selectedOption.dataset.provider : null;
+        
+        let activeProvider = providerSetting;
+        if (activeProvider === 'auto' && selectedModelProvider) {
+            activeProvider = selectedModelProvider;
+        }
 
-        const providers = [];
-        if (response.ollama) providers.push('Ollama');
-        if (response.lmstudio) providers.push('LMStudio');
+        let connected = false;
+        let blocked = false;
+        let blockedType = ''; // 'ollama' or 'lmstudio'
+        const connectedProviders = [];
 
-        if (providers.length > 0) {
+        if (response.ollama) connectedProviders.push('Ollama');
+        if (response.lmstudio) connectedProviders.push('LMStudio');
+
+        if (activeProvider === 'ollama') {
+            connected = response.ollama;
+            blocked = response.ollama_blocked;
+            blockedType = 'ollama';
+        } else if (activeProvider === 'lmstudio') {
+            connected = response.lmstudio;
+            blocked = response.lmstudio_blocked;
+            blockedType = 'lmstudio';
+        } else {
+            // 'auto' mode with no specific model selected yet
+            connected = connectedProviders.length > 0;
+            if (!connected) {
+                blocked = response.ollama_blocked || response.lmstudio_blocked;
+                blockedType = response.ollama_blocked ? 'ollama' : 'lmstudio';
+            }
+        }
+
+        if (connected) {
             statusDot.className = 'status-dot connected';
-            statusWrapper.title = `Connected: ${providers.join(', ')}`;
+            statusWrapper.title = `Connected: ${connectedProviders.join(', ')}`;
             providersAvailable = true;
             hideSetupBanner();
-        } else if (response.ollama_blocked) {
+        } else if (blocked) {
             statusDot.className = 'status-dot error';
-            statusWrapper.title = 'Ollama is running but blocking the extension (CORS)';
+            statusWrapper.title = blockedType === 'ollama'
+                ? 'Ollama is running but blocking the extension (CORS)'
+                : 'LMStudio is running but blocking the extension (CORS)';
             providersAvailable = false;
-            showSetupBanner('cors-blocked');
+            showSetupBanner(blockedType === 'ollama' ? 'cors-blocked-ollama' : 'cors-blocked-lmstudio');
         } else {
             statusDot.className = 'status-dot error';
             statusWrapper.title = 'No providers found';
@@ -348,11 +358,27 @@ function bannerHTML(type) {
             <div style="margin-top: 6px; font-size: 11px; opacity: 0.8;">Or download a model in LMStudio (search for "translate"). Click the refresh button above when done.</div>
         `;
     }
-    if (type === 'cors-blocked') {
+    if (type === 'cors-blocked-ollama') {
         return `
             <div style="font-weight: bold; margin-bottom: 4px; color: var(--yellow, #dbbc7f);">Ollama is blocking the extension</div>
-            <div>Ollama is running, but it is not allowing requests from browser extensions. You need to enable CORS.</div>
-            <div style="margin-top: 6px; font-size: 11px; opacity: 0.8;"><a href="https://api.onlyoffice.com/docs/plugin-and-macros/ai/configuring-ollama-with-cors/" target="_blank" style="color: var(--accent, #a7c080);">See instructions for your OS here</a>. Click the refresh button above when done.</div>
+            <div>Ollama is running, but it is not allowing requests from browser extensions (CORS policy).</div>
+            <div style="margin-top: 6px; font-size: 11px; opacity: 0.8;"><a href="https://api.onlyoffice.com/docs/plugin-and-macros/ai/configuring-ollama-with-cors/" target="_blank" style="color: var(--accent, #a7c080);">See CORS instructions for Ollama here</a>. Click the refresh button above when done.</div>
+        `;
+    }
+    if (type === 'cors-blocked-lmstudio') {
+        return `
+            <div style="font-weight: bold; margin-bottom: 4px; color: var(--yellow, #dbbc7f);">LM Studio is blocking the extension</div>
+            <div>LM Studio server is running, but Cross-Origin Resource Sharing (CORS) is disabled.</div>
+            <div style="margin-top: 6px; line-height: 1.4;">
+                To enable CORS:
+                <ol style="margin: 4px 0; padding-left: 18px;">
+                    <li>Open <b>LM Studio</b></li>
+                    <li>Go to the <b>Developer</b> tab (server icon on the left sidebar)</li>
+                    <li>Under <b>Server Settings</b>, activate <b>"Enable CORS"</b></li>
+                    <li>Restart the server</li>
+                </ol>
+            </div>
+            <div style="margin-top: 6px; font-size: 11px; opacity: 0.8;">Click the refresh button above when done.</div>
         `;
     }
     return `
@@ -401,7 +427,7 @@ function showSetupBanner(type = 'no-provider') {
 
 function hideSetupBanner() {
     const banner = document.getElementById('setup-banner');
-    if (banner) banner.hidden = true;
+    if (banner && providersAvailable) banner.hidden = true;
 }
 
 // Load available models
@@ -416,7 +442,13 @@ async function loadModels(forceRefresh = false) {
         if (models.length === 0) {
             elements.modelSelect.innerHTML = '<option value="">No models found</option>';
             if (providersAvailable) {
-                showSetupBanner('no-models');
+                // If any provider is blocked by CORS, prioritize showing the CORS banner
+                const detectResponse = await browserAPI.runtime.sendMessage({ type: 'DETECT_PROVIDERS' }).catch(() => ({}));
+                if (detectResponse.ollama_blocked || detectResponse.lmstudio_blocked) {
+                    showSetupBanner(detectResponse.ollama_blocked ? 'cors-blocked-ollama' : 'cors-blocked-lmstudio');
+                } else {
+                    showSetupBanner('no-models');
+                }
             }
             return;
         }
@@ -444,8 +476,8 @@ async function loadModels(forceRefresh = false) {
         elements.modelSelect.disabled = false;
         elements.translateBtn.disabled = false;
 
-        // Auto-configure format for the selected model
-        autoSetFormatForModel(elements.modelSelect.value);
+        // Refresh the "Auto → detected format" hint for the selected model
+        updateFormatUI();
 
     } catch (e) {
         console.error('Failed to load models:', e);
@@ -670,11 +702,8 @@ function setupEventListeners() {
 
     // Request format change
     elements.requestFormat.addEventListener('change', (e) => {
-        const format = e.target.value;
-        elements.customPrompts.hidden = format !== 'custom';
-        currentSettings.requestFormat = format;
-        updateFormatDescription(format);
-        updateSourceLangVisibility();
+        currentSettings.requestFormat = e.target.value;
+        updateFormatUI();
     });
 
     // Save settings button
@@ -690,8 +719,8 @@ function setupEventListeners() {
         const modelId = elements.modelSelect.value;
         currentSettings.selectedModel = modelId;
 
-        // Auto-detect TranslateGemma model and auto-switch format
-        autoSetFormatForModel(modelId);
+        // Refresh the "Auto → detected format" hint for the new model
+        updateFormatUI();
 
         saveCurrentSettings();
     });

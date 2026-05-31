@@ -78,6 +78,7 @@
                 <div class="form-group">
                     <label for="requestFormat">Request Format</label>
                     <select id="requestFormat">
+                        <option value="auto">Auto (detect from model)</option>
                         <option value="default">Default (JSON output)</option>
                         <option value="translategemma">TranslateGemma</option>
                         <option value="hunyuan">Hunyuan-MT</option>
@@ -147,6 +148,12 @@
                     <input type="checkbox" id="useStructuredOutput" checked>
                     <label for="useStructuredOutput">Use structured JSON output</label>
                     <p class="hint">Requests JSON format from the model. Disable if model struggles with JSON.</p>
+                </div>
+
+                <div class="form-group checkbox-group">
+                    <input type="checkbox" id="plainTextFallback" checked>
+                    <label for="plainTextFallback">Fall back to plain-text translation</label>
+                    <p class="hint">If a segment keeps coming back malformed, translate it on its own as plain text (no JSON). Slower, but avoids leaving text untranslated or breaking the page.</p>
                 </div>
 
                 <div class="form-group checkbox-group">

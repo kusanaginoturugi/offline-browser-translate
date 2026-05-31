@@ -18,14 +18,17 @@ const DEFAULT_SETTINGS = {
     useAdvanced: false,
     customSystemPrompt: '',
     customUserPromptTemplate: '',
-    requestFormat: 'default',
+    requestFormat: 'auto',
     temperature: 0.3,
     useStructuredOutput: true,
+    maxOutputRetries: 2,
+    plainTextFallback: true,
     showGlow: false  // Disabled by default
 };
 
 // Format descriptions
 const FORMAT_DESCRIPTIONS = {
+    auto: 'Picks the right format automatically based on the selected model.',
     default: 'Standard JSON output format. Best for most models.',
     translategemma: 'Specialized format for TranslateGemma models.',
     hunyuan: 'Format optimized for Hunyuan-MT models. No system message.',
@@ -86,6 +89,7 @@ const elements = {
     temperature: document.getElementById('temperature'),
     temperatureValue: document.getElementById('temperatureValue'),
     useStructuredOutput: document.getElementById('useStructuredOutput'),
+    plainTextFallback: document.getElementById('plainTextFallback'),
     showGlow: document.getElementById('showGlow'),
     debugLogging: document.getElementById('debugLogging'),
     floatingButton: document.getElementById('floatingButton'),
@@ -195,8 +199,9 @@ async function loadModels() {
                 elements.modelSelect.value = currentSettings.selectedModel;
             }
 
-            // Auto-configure format for the selected model
-            autoSetFormatForModel(elements.modelSelect.value);
+            // Refresh the "Auto → detected format" hint for the selected model
+            updateFormatDescription(elements.requestFormat.value);
+            updateVisibility();
         }
     } catch (e) {
         console.error('Failed to load models:', e);
@@ -261,6 +266,7 @@ function applySettingsToUI() {
         }
     }
     elements.useStructuredOutput.checked = currentSettings.useStructuredOutput;
+    if (elements.plainTextFallback) elements.plainTextFallback.checked = currentSettings.plainTextFallback !== false;
     elements.showGlow.checked = currentSettings.showGlow !== false;
     elements.debugLogging.checked = !!currentSettings.debug;
     elements.floatingButton.checked = !!currentSettings.floatingButton;
@@ -274,82 +280,57 @@ function applySettingsToUI() {
     updateVisibility();
 }
 
-// Update format description and prompt editor
-function updateFormatDescription(format) {
-    elements.formatDescription.textContent = FORMAT_DESCRIPTIONS[format] || '';
+// The effective format = the explicit choice, or (for 'auto') the one detected
+// from the selected model. resolveRequestFormat/detectRequestFormat come from languages.js.
+function getEffectiveFormat() {
+    const modelId = elements.modelSelect?.value || currentSettings.selectedModel;
+    return resolveRequestFormat({ requestFormat: elements.requestFormat.value }, modelId);
+}
 
-    // Populate prompt editor with format's template
-    const template = PROMPT_TEMPLATES[format];
+// Update format description and prompt editor. Shows the *effective* template so
+// the user can see what 'auto' resolved to for the current model.
+function updateFormatDescription(format) {
+    const effective = format === 'auto' ? getEffectiveFormat() : format;
+
+    let desc = FORMAT_DESCRIPTIONS[format] || '';
+    if (format === 'auto' && (elements.modelSelect?.value || currentSettings.selectedModel)) {
+        desc += ` Detected for this model: ${effective}.`;
+    }
+    elements.formatDescription.textContent = desc;
+
+    // Populate prompt editor with the effective format's template
+    const template = PROMPT_TEMPLATES[effective] || PROMPT_TEMPLATES.default;
     if (template && elements.systemPrompt && elements.userPrompt) {
-        // For custom format, use saved custom prompts
-        if (format === 'custom') {
+        if (effective === 'custom') {
             elements.systemPrompt.value = currentSettings.customSystemPrompt || '';
             elements.userPrompt.value = currentSettings.customUserPromptTemplate || '';
         } else {
             elements.systemPrompt.value = template.system || '';
             elements.userPrompt.value = template.user || '';
         }
-
-        // Trigger input event to update highlights
         elements.systemPrompt.dispatchEvent(new Event('input'));
         elements.userPrompt.dispatchEvent(new Event('input'));
     }
 }
 
-// Check if a model is a TranslateGemma model
-function isTranslateGemmaModel(modelId) {
-    if (!modelId) return false;
-    const lowerName = modelId.toLowerCase();
-    return lowerName.includes('translategemma') ||
-        lowerName.includes('translate-gemma') ||
-        lowerName.includes('translate_gemma');
-}
-
-// Automatically set format based on model type
-function autoSetFormatForModel(modelId) {
-    if (!modelId) return;
-
-    const isTranslateGemma = isTranslateGemmaModel(modelId);
-
-    if (isTranslateGemma) {
-        if (elements.requestFormat.value !== 'translategemma') {
-            elements.requestFormat.value = 'translategemma';
-            updateFormatDescription('translategemma');
-            updateVisibility();
-            showToast('Automatically switched to TranslateGemma format', 'success', 1500);
-        }
-        // TranslateGemma outputs plain text, not JSON — disable structured output
-        if (elements.useStructuredOutput.checked) {
-            elements.useStructuredOutput.checked = false;
-        }
-    } else {
-        // If switching away from TranslateGemma model and format is still TranslateGemma,
-        // switch back to default
-        if (elements.requestFormat.value === 'translategemma') {
-            elements.requestFormat.value = 'default';
-            updateFormatDescription('default');
-            updateVisibility();
-        }
-    }
-}
-
-// Update visibility of sections based on current settings
+// Update visibility of sections based on the effective format.
 function updateVisibility() {
-    const format = elements.requestFormat.value;
-    const isTranslateGemmaFormat = format === 'translategemma';
-    const modelId = elements.modelSelect?.value || currentSettings.selectedModel;
-    const isTranslateGemmaModelSelected = isTranslateGemmaModel(modelId);
+    const selected = elements.requestFormat.value;
+    const effective = getEffectiveFormat();
 
-    // Custom prompts section
-    elements.customPromptsSection.hidden = format !== 'custom';
+    // Custom prompts section — only when the user explicitly chose 'custom'
+    elements.customPromptsSection.hidden = selected !== 'custom';
 
-    // TranslateGemma help - only show when BOTH format is translategemma AND model is translategemma
-    elements.translateGemmaHelp.hidden = !(isTranslateGemmaFormat && isTranslateGemmaModelSelected);
+    // TranslateGemma help — when the effective format is translategemma
+    elements.translateGemmaHelp.hidden = effective !== 'translategemma';
 
-    // Source language only needed for TranslateGemma format
+    // Source language only matters for TranslateGemma's prompt
     if (elements.sourceLanguageGroup) {
-        elements.sourceLanguageGroup.hidden = !isTranslateGemmaFormat;
+        elements.sourceLanguageGroup.hidden = effective !== 'translategemma';
     }
+
+    // Structured JSON output is meaningless for plain-text formats; grey it out.
+    elements.useStructuredOutput.disabled = PLAIN_TEXT_FORMATS.has(effective);
 }
 
 // Save current settings
@@ -368,6 +349,7 @@ async function saveCurrentSettings() {
         maxConcurrentRequests: parseInt(elements.maxConcurrent?.value) || 4,
         temperature: parseFloat(elements.temperature.value) || 0.3,
         useStructuredOutput: elements.useStructuredOutput.checked,
+        plainTextFallback: elements.plainTextFallback ? elements.plainTextFallback.checked : true,
         showGlow: elements.showGlow.checked,
         debug: elements.debugLogging.checked,
         floatingButton: elements.floatingButton.checked,
@@ -424,8 +406,8 @@ function setupEventListeners() {
     if (elements.modelSelect) {
         elements.modelSelect.addEventListener('change', () => {
             currentSettings.selectedModel = elements.modelSelect.value;
-            autoSetFormatForModel(currentSettings.selectedModel);
-            updateVisibility(); // Update TranslateGemma help visibility
+            updateFormatDescription(elements.requestFormat.value);
+            updateVisibility(); // Refresh detected-format hint + TranslateGemma help
         });
     }
 
