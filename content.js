@@ -44,12 +44,14 @@ browserAPI.storage.onChanged.addListener((changes, area) => {
     }
 });
 
-// Track text nodes and their original content
-const textNodeMap = new Map();
+// Track text nodes and their segments
+const textNodeMap = new Map(); // Maps nodeId -> { node, originalText, segments: [...] }
+const segmentToNodeIdMap = new Map(); // Maps segmentId -> nodeId
 const translatedNodeSet = new Set(); // Track which nodes have been translated
 let translationInProgress = false;
 let translationCancelled = false;  // Flag to cancel ongoing translation
-let nextId = 0;
+let nextNodeId = 0;
+let nextSegmentId = 0;
 let currentTargetLanguage = 'en';
 let maxConcurrentRequests = 4; // Default parallel requests (LMStudio 0.4.0+ supports up to 4)
 let autoTranslateEnabled = false;
@@ -83,9 +85,19 @@ function shouldSkipElement(element) {
     if (!element || !element.tagName) return true;
     if (SKIP_TAGS.has(element.tagName)) return true;
     if (element.isContentEditable) return true;
-    if (element.getAttribute('translate') === 'no') return true;
-    // Skip our own status element
-    if (element.id === 'llm-translator-status') return true;
+    
+    // Check ancestors recursively for translate="no" or our extension elements
+    let curr = element;
+    while (curr) {
+        if (curr.getAttribute && curr.getAttribute('translate') === 'no') {
+            return true;
+        }
+        if (curr.id === 'llm-translator-status' || curr.id === 'llm-translator-float-btn') {
+            return true;
+        }
+        curr = curr.parentElement;
+    }
+    
     return false;
 }
 
@@ -104,6 +116,15 @@ function isTranslatableText(text) {
 }
 
 /**
+ * Split text into sentence-level segments while preserving all whitespace and punctuation
+ */
+function splitIntoSentences(text) {
+    if (!text) return [];
+    const regex = /[^.!?。？！]+(?:[.!?]+(?:\s+|$)|[。？！]+|$)|[.!?。？！\s]+/gu;
+    return text.match(regex) || [text];
+}
+
+/**
  * Check if a text node has already been processed
  */
 function isNodeProcessed(node) {
@@ -112,13 +133,14 @@ function isNodeProcessed(node) {
 
 /**
  * Calculate priority score for a text node (higher = more important, translate first)
- * 
- * Priority factors:
- * 1. Viewport visibility (must be in view)
- * 2. Text length (longer = more valuable content)
- * 3. Semantic context (main/article vs nav/sidebar)
- * 4. Tag type (P, H1-H6 vs SPAN, A, LABEL)
+ * Factors: viewport visibility, semantic context (main vs sidebar), parent tag type.
  */
+const TAG_PRIORITY = {
+    P: 80, H1: 70, H2: 60, H3: 50, H4: 40, H5: 40, H6: 40,
+    LI: 30, BLOCKQUOTE: 25, FIGCAPTION: 25, TD: 20, TH: 20,
+    SPAN: 5, DIV: 5, A: -10, LABEL: -30, BUTTON: -50
+};
+
 function calculatePriority(node) {
     const parent = node.parentElement;
     if (!parent) return 0;
@@ -126,114 +148,58 @@ function calculatePriority(node) {
     let priority = 0;
     const rect = parent.getBoundingClientRect();
 
-    // 1. Viewport visibility (CRITICAL)
-    const inViewport = (
-        rect.top < window.innerHeight &&
-        rect.bottom > 0 &&
-        rect.left < window.innerWidth &&
-        rect.right > 0
-    );
-
-    if (inViewport) {
-        priority += 10000;
-        // Top half of viewport gets slight bonus
-        if (rect.top >= 0 && rect.top < window.innerHeight / 2) {
-            priority += 200;
-        }
+    // Viewport visibility (dominant factor)
+    if (rect.top < window.innerHeight && rect.bottom > 0 &&
+        rect.left < window.innerWidth && rect.right > 0) {
+        priority += 1000;
     }
 
-    // 2. TEXT LENGTH - longer text is more valuable (main content vs labels)
-    const textLength = node.textContent.trim().length;
-    if (textLength >= 200) priority += 150;      // Long paragraph
-    else if (textLength >= 100) priority += 100; // Medium paragraph
-    else if (textLength >= 50) priority += 60;   // Short paragraph
-    else if (textLength >= 20) priority += 30;   // Sentence
-    else priority -= 20;                          // Very short = likely UI label
-
-    // 3. SEMANTIC CONTEXT - detect main content vs sidebars
-    let ancestor = parent;
-    let inMainContent = false;
-    let inSidebar = false;
-    let depth = 0;
-
-    while (ancestor && depth < 15) {
-        const tag = ancestor.tagName;
-        const id = (ancestor.id || '').toLowerCase();
-        const classes = (ancestor.className && typeof ancestor.className === 'string')
-            ? ancestor.className.toLowerCase() : '';
-        const role = (ancestor.getAttribute('role') || '').toLowerCase();
-
-        // Main content indicators (+500)
-        if (tag === 'MAIN' || tag === 'ARTICLE') {
-            inMainContent = true;
-        }
-        if (role === 'main' || role === 'article') {
-            inMainContent = true;
-        }
-        if (id.includes('content') || id.includes('article') || id.includes('main-text') ||
-            id.includes('mw-content') || id.includes('post') || id.includes('entry')) {
-            inMainContent = true;
-        }
-        if (classes.includes('content') || classes.includes('article') ||
-            classes.includes('post') || classes.includes('entry') ||
-            classes.includes('mw-parser-output') || classes.includes('mw-content')) {
-            inMainContent = true;
-        }
-
-        // Sidebar/nav indicators (-300)
-        if (tag === 'NAV' || tag === 'ASIDE' || tag === 'FOOTER' || tag === 'HEADER') {
-            inSidebar = true;
-        }
-        if (role === 'navigation' || role === 'complementary' ||
-            role === 'banner' || role === 'contentinfo' || role === 'menu') {
-            inSidebar = true;
-        }
-        if (id.includes('sidebar') || id.includes('nav') || id.includes('menu') ||
-            id.includes('footer') || id.includes('header') || id.includes('toc') ||
-            id.includes('widget') || id.includes('prefs') || id.includes('toolbar')) {
-            inSidebar = true;
-        }
-        if (classes.includes('sidebar') || classes.includes('nav') ||
-            classes.includes('menu') || classes.includes('footer') ||
-            classes.includes('header') || classes.includes('widget') ||
-            classes.includes('toc') || classes.includes('infobox') ||
-            classes.includes('mw-portlet') || classes.includes('vector-')) {
-            inSidebar = true;
-        }
-
-        ancestor = ancestor.parentElement;
-        depth++;
+    // Semantic context via closest() — main content vs sidebar/nav
+    if (parent.closest('main, article, [role="main"], [role="article"]')) {
+        priority += 500;
+    } else if (parent.closest('nav, aside, footer, header, [role="navigation"], [role="complementary"]')) {
+        priority -= 300;
     }
 
-    if (inMainContent && !inSidebar) priority += 500;
-    else if (inMainContent && inSidebar) priority += 100; // Mixed signals
-    else if (inSidebar) priority -= 300;
-
-    // 4. TAG TYPE - paragraphs and headings are main content
-    const tagName = parent.tagName;
-    if (tagName === 'P') priority += 80;
-    else if (tagName === 'H1') priority += 70;
-    else if (tagName === 'H2') priority += 60;
-    else if (tagName === 'H3') priority += 50;
-    else if (tagName === 'H4' || tagName === 'H5' || tagName === 'H6') priority += 40;
-    else if (tagName === 'LI') priority += 30;
-    else if (tagName === 'TD' || tagName === 'TH') priority += 20;
-    else if (tagName === 'BLOCKQUOTE' || tagName === 'FIGCAPTION') priority += 25;
-    else if (tagName === 'SPAN') priority += 5;
-    else if (tagName === 'DIV') priority += 5;
-    else if (tagName === 'A') priority -= 10;      // Links are usually navigation
-    else if (tagName === 'LABEL') priority -= 30;  // Form labels
-    else if (tagName === 'BUTTON') priority -= 50; // UI buttons
-
-    // 5. Position penalty for elements far from center (likely sidebars)
-    const centerX = rect.left + rect.width / 2;
-    const pageCenter = window.innerWidth / 2;
-    const distanceFromCenter = Math.abs(centerX - pageCenter);
-    if (distanceFromCenter > window.innerWidth * 0.35) {
-        priority -= 100; // Far from center = likely sidebar
-    }
+    // Tag type
+    priority += TAG_PRIORITY[parent.tagName] || 0;
 
     return Math.max(0, priority);
+}
+
+/**
+ * Register a text node: split into segments, add to maps, return text items for translation.
+ */
+function registerTextNode(node) {
+    const nodeId = nextNodeId++;
+    const priority = calculatePriority(node);
+    const originalText = node.textContent;
+    const segments = [];
+    const textItems = [];
+
+    const rawSegments = originalText.length > 200
+        ? splitIntoSentences(originalText) : [originalText];
+
+    for (const rawSeg of rawSegments) {
+        if (isTranslatableText(rawSeg)) {
+            const segmentId = nextSegmentId++;
+            segmentToNodeIdMap.set(segmentId, nodeId);
+            segments.push({
+                id: segmentId, originalText: rawSeg,
+                translatedText: null, processedTranslatedText: null, translated: false
+            });
+            textItems.push({ id: segmentId, text: rawSeg.trim(), priority });
+        } else {
+            segments.push({
+                id: null, originalText: rawSeg,
+                translatedText: null, processedTranslatedText: null, translated: false
+            });
+        }
+    }
+
+    textNodeMap.set(nodeId, { node, originalText, segments });
+    translatedNodeSet.add(node);
+    return textItems;
 }
 
 /**
@@ -242,8 +208,10 @@ function calculatePriority(node) {
 function extractTextNodes(root = document.body, onlyNew = false) {
     if (!onlyNew) {
         textNodeMap.clear();
+        segmentToNodeIdMap.clear();
         translatedNodeSet.clear();
-        nextId = 0;
+        nextNodeId = 0;
+        nextSegmentId = 0;
     }
 
     const walker = document.createTreeWalker(
@@ -274,16 +242,7 @@ function extractTextNodes(root = document.body, onlyNew = false) {
     const textItems = [];
     let node;
     while (node = walker.nextNode()) {
-        const id = nextId++;
-        const text = node.textContent.trim();
-        const priority = calculatePriority(node);
-
-        textNodeMap.set(id, {
-            node,
-            originalText: node.textContent
-        });
-
-        textItems.push({ id, text, priority });
+        textItems.push(...registerTextNode(node));
     }
 
     // Sort by priority (highest first) - visible headings get translated first
@@ -303,13 +262,7 @@ function extractNewTextNodes(addedNodes) {
             if (!isNodeProcessed(node) && isTranslatableText(node.textContent)) {
                 const parent = node.parentElement;
                 if (parent && !shouldSkipElement(parent)) {
-                    const id = nextId++;
-                    const priority = calculatePriority(node);
-                    textNodeMap.set(id, {
-                        node,
-                        originalText: node.textContent
-                    });
-                    textItems.push({ id, text: node.textContent.trim(), priority });
+                    textItems.push(...registerTextNode(node));
                 }
             }
         } else if (node.nodeType === Node.ELEMENT_NODE) {
@@ -351,17 +304,33 @@ function extractSelectionTextNodes(selection) {
         let node;
         while (node = walker.nextNode()) {
             seenNodes.add(node);
-            // Reuse existing ID if this node was already registered (e.g. from a full-page translate)
-            let existingId = null;
-            for (const [id, entry] of textNodeMap) {
-                if (entry.node === node) { existingId = id; break; }
+            
+            // Reuse existing entry if this node was already registered
+            let existingNodeId = null;
+            let existingEntry = null;
+            for (const [nodeId, entry] of textNodeMap) {
+                if (entry.node === node) {
+                    existingNodeId = nodeId;
+                    existingEntry = entry;
+                    break;
+                }
             }
-            if (existingId !== null) {
-                textItems.push({ id: existingId, text: node.textContent.trim(), priority: calculatePriority(node) });
+
+            const priority = calculatePriority(node);
+            if (existingEntry !== null) {
+                // Node already registered, extract its translatable segments
+                for (const seg of existingEntry.segments) {
+                    if (seg.id !== null) {
+                        textItems.push({
+                            id: seg.id,
+                            text: seg.originalText.trim(),
+                            priority
+                        });
+                    }
+                }
             } else {
-                const id = nextId++;
-                textNodeMap.set(id, { node, originalText: node.textContent });
-                textItems.push({ id, text: node.textContent.trim(), priority: calculatePriority(node) });
+                // New node, register it
+                textItems.push(...registerTextNode(node));
             }
         }
     }
@@ -399,32 +368,54 @@ function startKeepAlive() {
 /**
  * Replace text node content with translation
  */
-function replaceTextNode(id, translatedText) {
-    const entry = textNodeMap.get(id);
-    if (!entry) {
-        console.warn(`[Translator] Node ${id} not found in map`);
+function replaceTextNode(segmentId, translatedText) {
+    const nodeId = segmentToNodeIdMap.get(segmentId);
+    if (nodeId === undefined) {
+        console.warn(`[Translator] Segment ID ${segmentId} not found in lookup map`);
         return false;
     }
 
-    const { node, originalText } = entry;
+    const entry = textNodeMap.get(nodeId);
+    if (!entry) {
+        console.warn(`[Translator] Node ID ${nodeId} not found in map`);
+        return false;
+    }
+
+    const { node, originalText, segments } = entry;
+    const segment = segments.find(s => s.id === segmentId);
+    if (!segment) {
+        console.warn(`[Translator] Segment ${segmentId} not found in node ${nodeId}`);
+        return false;
+    }
 
     try {
-        const leadingSpace = originalText.match(/^\s*/)[0];
-        const trailingSpace = originalText.match(/\s*$/)[0];
+        const segOriginalText = segment.originalText;
+        const leadingSpace = segOriginalText.match(/^\s*/)[0];
+        const trailingSpace = segOriginalText.match(/\s*$/)[0];
+
+        // Trim LLM's response to get pure text content first, so we don't end up with doubled spaces
+        const trimmedTranslation = (translatedText || '').trim();
 
         // For spaceless languages (Japanese, Chinese, etc.), add spacing when translating
         // to spaced languages if there was no original spacing
-        let finalText = translatedText;
-        if (!trailingSpace && translatedText) {
+        let effectiveTrailingSpace = trailingSpace;
+        if (!effectiveTrailingSpace && trimmedTranslation) {
             // Check if original text looks like a spaceless language (contains CJK characters)
-            const hasCJK = /[\u3000-\u9fff\uff00-\uffef]/.test(originalText);
+            const hasCJK = /[\u3000-\u9fff\uff00-\uffef]/.test(segOriginalText);
             if (hasCJK) {
                 // Always add trailing space for CJK source
-                finalText = translatedText + ' ';
+                effectiveTrailingSpace = ' ';
             }
         }
 
-        node.textContent = leadingSpace + finalText + (trailingSpace && !finalText.endsWith(' ') ? trailingSpace : '');
+        const processedText = leadingSpace + trimmedTranslation + effectiveTrailingSpace;
+        segment.translatedText = translatedText;
+        segment.processedTranslatedText = processedText;
+        segment.translated = true;
+
+        // Reconstruct full node text
+        const joinedText = segments.map(s => s.translated && s.processedTranslatedText !== null ? s.processedTranslatedText : s.originalText).join('');
+        node.textContent = joinedText;
 
         // Add blue glow effect to parent element (if enabled)
         const parent = node.parentElement;
@@ -435,14 +426,11 @@ function replaceTextNode(id, translatedText) {
             parent.dataset.translated = 'true';
         }
 
-        entry.translated = true;
-        entry.translatedText = translatedText;
         translatedNodeSet.add(node);
-        // Debug logging disabled to reduce console noise
-        // console.log(`[Translator] Replaced node ${id}: "${originalText.substring(0, 30)}..." -> "${translatedText.substring(0, 30)}..."`);
+        debugLog(`[Translator] Replaced segment ${segmentId} in node ${nodeId}: "${segOriginalText}" -> "${processedText}"`);
         return true;
     } catch (e) {
-        console.error(`[Translator] Failed to replace node ${id}:`, e);
+        console.error(`[Translator] Failed to replace segment ${segmentId} in node ${nodeId}:`, e);
         return false;
     }
 }
@@ -451,11 +439,11 @@ function replaceTextNode(id, translatedText) {
  * Restore original text for all translated nodes
  */
 function restoreOriginalText() {
-    for (const [id, entry] of textNodeMap) {
-        if (entry.translated) {
+    for (const [nodeId, entry] of textNodeMap) {
+        let hasAnyTranslated = entry.segments.some(s => s.translated);
+        if (hasAnyTranslated) {
             try {
                 entry.node.textContent = entry.originalText;
-                // Keep translated = true so we can toggle back
                 translatedNodeSet.delete(entry.node);
             } catch (e) {
                 // Node may have been removed
@@ -474,11 +462,12 @@ function restoreCachedTranslations() {
     if (!hasTranslationCache) return false;
 
     let restoredCount = 0;
-    for (const [id, entry] of textNodeMap) {
-        if (entry.translatedText && entry.originalText !== entry.translatedText) {
+    for (const [nodeId, entry] of textNodeMap) {
+        let hasAnyTranslated = entry.segments.some(s => s.translated && s.processedTranslatedText !== null);
+        if (hasAnyTranslated) {
             try {
-                entry.node.textContent = entry.translatedText;
-                entry.translated = true;
+                const joinedText = entry.segments.map(s => s.translated && s.processedTranslatedText !== null ? s.processedTranslatedText : s.originalText).join('');
+                entry.node.textContent = joinedText;
                 translatedNodeSet.add(entry.node);
                 restoredCount++;
             } catch (e) {
@@ -499,6 +488,7 @@ function showStatus(message, isError = false) {
     if (!statusEl) {
         statusEl = document.createElement('div');
         statusEl.id = 'llm-translator-status';
+        statusEl.setAttribute('translate', 'no');
         statusEl.style.cssText = `
       position: fixed;
       bottom: 20px;
@@ -558,7 +548,7 @@ function getPageLanguage() {
 async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto', retries = 3) {
     if (textItems.length === 0) return { applied: 0, failed: [] };
 
-    // console.log(`[Translator] translateBatch called with ${textItems.length} items`);
+    debugLog(`[Translator] translateBatch called for ${textItems.length} items:`, textItems);
 
     // Use passed source language if valid, otherwise detect from page
     const pageLanguage = (sourceLanguage && sourceLanguage !== 'auto')
@@ -568,6 +558,9 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
     let lastError = null;
     for (let attempt = 0; attempt < retries; attempt++) {
         try {
+            if (attempt > 0) {
+                debugLog(`[Translator] Retrying batch, attempt ${attempt + 1}/${retries}`);
+            }
             const response = await browserAPI.runtime.sendMessage({
                 type: 'TRANSLATE',
                 texts: textItems,
@@ -575,14 +568,14 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
                 sourceLanguage: pageLanguage // Pass detected page language for TranslateGemma
             });
 
-            // console.log(`[Translator] translateBatch response:`, response);
+            debugLog(`[Translator] translateBatch response:`, response);
 
             if (response.error) {
                 throw new Error(response.error);
             }
 
             const { translations } = response;
-            // console.log(`[Translator] Got ${translations?.length} translations back for ${textItems.length} items`);
+            debugLog(`[Translator] Got ${translations?.length} translations back for ${textItems.length} items`);
 
             let applied = 0;
             const failed = [];
@@ -623,6 +616,7 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
         } catch (e) {
             lastError = e;
             console.warn(`[Translator] Attempt ${attempt + 1}/${retries} failed:`, e.message);
+            debugWarn(`[Translator] Batch translation failed with exception:`, e, 'on items:', textItems);
 
             // Wait before retry (exponential backoff)
             if (attempt < retries - 1) {
@@ -637,7 +631,6 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
 }
 
 
-
 /**
  * Handle scroll event - recalculate priorities after user stops scrolling
  */
@@ -647,7 +640,6 @@ function onScroll() {
     }
     scrollDebounceTimer = setTimeout(() => {
         if (pendingTranslationQueue.length > 0) {
-            // console.log('[Translator] Recalculating priorities after scroll');
             recalculatePendingPriorities();
         }
     }, 100); // 100ms debounce for snappier updates
@@ -666,11 +658,6 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
     translationInProgress = true;
     translationCancelled = false;
     showStatus('Extracting text...');
-
-    // Log source language if provided
-    if (sourceLanguage && sourceLanguage !== 'auto') {
-        // console.log(`[Translator] Using explicit source language: ${sourceLanguage}`);
-    }
 
     // Add scroll listener for dynamic priority
     window.addEventListener('scroll', onScroll, { passive: true });
@@ -745,46 +732,12 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
         }
 
         if (!translationCancelled) {
-            // Retry failed items silently (up to 2 additional attempts)
-            let retryAttempts = 0;
-            const maxRetries = 2;
-
-            while (failedItems.length > 0 && retryAttempts < maxRetries && !translationCancelled) {
-                retryAttempts++;
-                console.log(`[Translator] Retry attempt ${retryAttempts} for ${failedItems.length} failed items`);
-
-                // Show progress as percentage (continuing from where we left off)
-                const percent = Math.min(100, Math.round((totalApplied / totalItems) * 100));
-                showStatus(`Translating... ${percent}%`);
-
-                // Wait a bit before retry
-                await new Promise(r => setTimeout(r, 500 * retryAttempts));
-
-                const itemsToRetry = [...failedItems];
-                failedItems.length = 0; // Clear for this round
-
-                // Process in smaller batches for retries
-                const retryBatchSize = 4;
-                for (let i = 0; i < itemsToRetry.length && !translationCancelled; i += retryBatchSize) {
-                    const batch = itemsToRetry.slice(i, i + retryBatchSize);
-                    try {
-                        const result = await translateBatch(batch, targetLanguage, sourceLanguage, 1); // Single retry per batch
-                        totalApplied += result.applied;
-                        if (result.failed && result.failed.length > 0) {
-                            failedItems.push(...result.failed);
-                        }
-                    } catch (e) {
-                        failedItems.push(...batch);
-                    }
-                }
-            }
-
             // Show completion message with stats
             const successRate = Math.round((totalApplied / totalItems) * 100);
             let statusMsg = `Translated ${totalApplied}/${totalItems} elements (${successRate}%)`;
 
             if (failedItems.length > 0) {
-                console.warn(`[Translator] ${failedItems.length} items still failed after retries:`,
+                console.warn(`[Translator] ${failedItems.length} items failed:`,
                     failedItems.slice(0, 5).map(f => f.text.substring(0, 30)));
                 statusMsg += ` - ${failedItems.length} failed`;
             }
@@ -827,23 +780,16 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
  */
 function recalculatePendingPriorities() {
     for (const item of pendingTranslationQueue) {
-        const entry = textNodeMap.get(item.id);
-        if (entry && entry.node && entry.node.parentElement) {
-            item.priority = calculatePriority(entry.node);
+        const nodeId = segmentToNodeIdMap.get(item.id);
+        if (nodeId !== undefined) {
+            const entry = textNodeMap.get(nodeId);
+            if (entry && entry.node && entry.node.parentElement) {
+                item.priority = calculatePriority(entry.node);
+            }
         }
     }
     // Re-sort by new priorities
     pendingTranslationQueue.sort((a, b) => b.priority - a.priority);
-
-    // Debug log top 3 items
-    // if (pendingTranslationQueue.length > 0) {
-    //     const top = pendingTranslationQueue.slice(0, 3);
-    //     console.log('[Translator] Top priority items after scroll:', top.map(i => ({
-    //         id: i.id,
-    //         text: i.text.substring(0, 20),
-    //         prio: i.priority
-    //     })));
-    // }
 }
 
 /**
@@ -973,21 +919,6 @@ async function translateSelection(targetLanguage, sourceLanguage = 'auto') {
             if (result.failed && result.failed.length > 0) failedItems.push(...result.failed);
             const percent = Math.min(100, Math.round(((i + batch.length) / textItems.length) * 100));
             showStatus(`Translating selection... ${percent}%`);
-        }
-
-        // Retry failed items (up to 2 attempts, smaller batches)
-        let retryAttempts = 0;
-        const maxRetries = 2;
-        while (failedItems.length > 0 && retryAttempts < maxRetries && !translationCancelled) {
-            retryAttempts++;
-            await new Promise(r => setTimeout(r, 500 * retryAttempts));
-            const itemsToRetry = failedItems.splice(0, failedItems.length);
-            for (let i = 0; i < itemsToRetry.length && !translationCancelled; i += 4) {
-                const batch = itemsToRetry.slice(i, i + 4);
-                const result = await translateBatch(batch, targetLanguage, sourceLanguage, 1);
-                totalApplied += result.applied;
-                if (result.failed && result.failed.length > 0) failedItems.push(...result.failed);
-            }
         }
 
         if (totalApplied > 0) {
@@ -1160,6 +1091,7 @@ function getFloatingTranslateBtn() {
 
     const btn = document.createElement('div');
     btn.id = 'llm-translator-float-btn';
+    btn.setAttribute('translate', 'no');
     btn.title = `Translate to ${getLanguageName(currentTargetLanguage)}`;
     btn.style.cssText = [
         'position:absolute', 'width:2em', 'height:2em', 'cursor:pointer',
