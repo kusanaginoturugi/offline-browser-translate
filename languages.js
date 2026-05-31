@@ -195,14 +195,68 @@ function getLanguageCode(name) {
     return null;
 }
 
+// ============================================================================
+// Model → request-format mapping (single source of truth)
+// ============================================================================
+// Each rule maps a model family to the request format it needs. `patterns` are
+// matched as case-insensitive substrings against the model id. `plainText: true`
+// means the model returns a bare translation (no JSON to parse).
+// Add a new model family by adding one entry here — nothing else needs to change.
+const MODEL_FORMAT_RULES = [
+    { format: 'translategemma', plainText: true, patterns: ['translategemma', 'translate-gemma', 'translate_gemma'] },
+    { format: 'hunyuan',        plainText: true, patterns: ['hunyuan-mt', 'hunyuanmt', 'hunyuan_mt'] }
+];
+
+// Formats that produce plain text instead of JSON (derived from the rules above).
+const PLAIN_TEXT_FORMATS = new Set(MODEL_FORMAT_RULES.filter(r => r.plainText).map(r => r.format));
+
+/**
+ * Detect the request format a given model needs, based on its id.
+ * Returns the matching format, or 'default' when nothing matches.
+ * @param {string} modelId
+ * @returns {string}
+ */
+function detectRequestFormat(modelId) {
+    if (!modelId) return 'default';
+    const id = modelId.toLowerCase();
+    for (const rule of MODEL_FORMAT_RULES) {
+        if (rule.patterns.some(p => id.includes(p))) return rule.format;
+    }
+    return 'default';
+}
+
+/**
+ * Resolve the effective request format for a settings object.
+ * When requestFormat is 'auto', it is derived from the selected model;
+ * otherwise the explicit choice is respected.
+ * @param {{requestFormat?: string, selectedModel?: string}} settings
+ * @param {string} [modelId] - overrides settings.selectedModel if provided
+ * @returns {string}
+ */
+function resolveRequestFormat(settings, modelId) {
+    const fmt = settings && settings.requestFormat;
+    if (!fmt || fmt === 'auto') {
+        return detectRequestFormat(modelId || (settings && settings.selectedModel));
+    }
+    return fmt;
+}
+
 // Export for use in other scripts (will be included via script tag)
 // These will be available as global variables
 if (typeof window !== 'undefined') {
     window.LANGUAGES = LANGUAGES;
     window.getLanguageName = getLanguageName;
     window.getLanguageCode = getLanguageCode;
+    window.MODEL_FORMAT_RULES = MODEL_FORMAT_RULES;
+    window.PLAIN_TEXT_FORMATS = PLAIN_TEXT_FORMATS;
+    window.detectRequestFormat = detectRequestFormat;
+    window.resolveRequestFormat = resolveRequestFormat;
 } else if (typeof self !== 'undefined') {
     self.LANGUAGES = LANGUAGES;
     self.getLanguageName = getLanguageName;
     self.getLanguageCode = getLanguageCode;
+    self.MODEL_FORMAT_RULES = MODEL_FORMAT_RULES;
+    self.PLAIN_TEXT_FORMATS = PLAIN_TEXT_FORMATS;
+    self.detectRequestFormat = detectRequestFormat;
+    self.resolveRequestFormat = resolveRequestFormat;
 }
