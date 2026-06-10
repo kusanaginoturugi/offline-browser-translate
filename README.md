@@ -11,6 +11,7 @@ A privacy-focused browser extension that translates web pages using local LLMs (
 - 🔒 **100% Private** - All translations happen on your local machine via Ollama or LMStudio
 - 🎯 **Smart Prioritization** - Visible content and headings are translated first
 - 🌍 **Many Languages** - Supports many many languages :3
+- ⚡ **Translation Cache** - Remembers translated text so identical segments (menus, buttons, nav) aren't re-translated, even across reloads and other pages
 
 ## Requirements
 
@@ -27,6 +28,17 @@ With a translation-capable model loaded (e.g. `TranslateGemma`, `tencent.hunyuan
 1. Go to `about:debugging#/runtime/this-firefox`
 2. Click **Load Temporary Add-on**
 3. Select the `manifest.json` file
+
+This is temporary and is removed on restart. For a persistent install, package it
+as an `.xpi` and load it in a browser that allows unsigned add-ons (Firefox
+Developer Edition / Nightly / ESR with `xpinstall.signatures.required = false`):
+
+1. Run `./mkxpi.sh` to produce `local-llm-translator-<version>.xpi`
+2. Go to `about:addons` → gear icon → **Install Add-on From File**
+3. Select the generated `.xpi`
+
+An xpi is just a zip with `manifest.json` at the root, so no signing or `web-ext`
+is needed. Bump `version` in `manifest.json` and re-run `./mkxpi.sh` to update.
 
 ### Chrome / Chromium
 1. Go to `chrome://extensions`
@@ -76,6 +88,7 @@ Click **Advanced Settings** to configure:
 | Temperature | Model creativity (lower = more consistent) |
 | Request Format (*work in progress*) | Default JSON, Hunyuan-MT, Simple, or Custom |
 | Show Glow | Toggle visual indicator on translated text |
+| Cache translations | Remember translated text and skip re-translating identical segments (cached per model + language pair); includes a button to clear the cache |
 
 ## File Structure
 
@@ -87,7 +100,8 @@ Click **Advanced Settings** to configure:
 │   ├── popup.html     # Popup UI
 │   ├── popup.css      # Styles (Everforest Dark theme)
 │   └── popup.js       # Popup logic
-└── icons/             # Extension icons
+├── icons/             # Extension icons
+└── mkxpi.sh           # Build an installable .xpi (no signing needed)
 ```
 
 ## Development

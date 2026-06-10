@@ -92,6 +92,8 @@ const elements = {
     plainTextFallback: document.getElementById('plainTextFallback'),
     showGlow: document.getElementById('showGlow'),
     debugLogging: document.getElementById('debugLogging'),
+    useTranslationCache: document.getElementById('useTranslationCache'),
+    clearCache: document.getElementById('clearCache'),
     floatingButton: document.getElementById('floatingButton'),
     customPromptsSection: document.getElementById('customPromptsSection'),
     customSystem: document.getElementById('customSystem'),
@@ -269,6 +271,7 @@ function applySettingsToUI() {
     if (elements.plainTextFallback) elements.plainTextFallback.checked = currentSettings.plainTextFallback !== false;
     elements.showGlow.checked = currentSettings.showGlow !== false;
     elements.debugLogging.checked = !!currentSettings.debug;
+    if (elements.useTranslationCache) elements.useTranslationCache.checked = currentSettings.useTranslationCache !== false;
     elements.floatingButton.checked = !!currentSettings.floatingButton;
     elements.customSystem.value = currentSettings.customSystemPrompt || '';
     elements.customUser.value = currentSettings.customUserPromptTemplate || '';
@@ -352,6 +355,7 @@ async function saveCurrentSettings() {
         plainTextFallback: elements.plainTextFallback ? elements.plainTextFallback.checked : true,
         showGlow: elements.showGlow.checked,
         debug: elements.debugLogging.checked,
+        useTranslationCache: elements.useTranslationCache ? elements.useTranslationCache.checked : true,
         floatingButton: elements.floatingButton.checked,
         // Save custom prompts from the new prompt editor
         customSystemPrompt: elements.systemPrompt?.value || elements.customSystem?.value || '',
@@ -436,6 +440,15 @@ function setupEventListeners() {
         await loadModels();
         showToast('Settings reset to defaults');
     });
+
+    // Clear translation cache
+    if (elements.clearCache) {
+        elements.clearCache.addEventListener('click', async () => {
+            const res = await browserAPI.runtime.sendMessage({ type: 'CLEAR_TRANSLATION_CACHE' });
+            if (res && res.ok) showToast('Translation cache cleared');
+            else showToast('Failed to clear cache', 'error');
+        });
+    }
 
     // Copy LM Studio template
     elements.copyTemplate.addEventListener('click', () => {
