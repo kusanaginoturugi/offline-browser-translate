@@ -388,6 +388,12 @@ function replaceTextNode(segmentId, translatedText) {
         return false;
     }
 
+    // Node may have been detached (e.g. SPA navigation) — skip so we don't
+    // count an invisible replacement as applied or leave a stale flag.
+    if (!node.isConnected) {
+        return false;
+    }
+
     try {
         const segOriginalText = segment.originalText;
         const leadingSpace = segOriginalText.match(/^\s*/)[0];
@@ -1170,3 +1176,11 @@ document.addEventListener('selectionchange', () => {
 window.addEventListener('scroll', () => {
     if (floatingTranslateBtn && floatingTranslateBtn.style.display !== 'none') hideFloatingBtn();
 }, { passive: true });
+
+// Page is navigating away / unloading — tell the background to abort this tab's
+// in-flight LLM requests so they don't run to the 5min timeout. Fire-and-forget:
+// the document is being torn down, so we can't await a response.
+window.addEventListener('pagehide', () => {
+    if (!translationInProgress) return;
+    try { browserAPI.runtime.sendMessage({ type: 'CANCEL_TRANSLATION' }); } catch (e) {}
+});
