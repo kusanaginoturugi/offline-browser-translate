@@ -6,6 +6,11 @@
 examples/スカイリム日英対訳表_*.html
 examples/skyrim-full.tsv
 examples/skyrim-singleword.tsv
+examples/skyrim-katakana.tsv
+examples/skyrim-other.tsv
+examples/skyrim-other-multi.tsv
+examples/skyrim-other-single.tsv
+examples/skyrim-other-single-verbs.tsv
 
 # Editor lock/backup files
 .#*
