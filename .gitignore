@@ -1,3 +1,12 @@
 # Build artifacts (extension packages uploaded to Firefox)
 *.zip
 *.xpi
+
+# Skyrim glossary source/extracted data (license unclear — keep out of repo)
+examples/スカイリム日英対訳表_*.html
+examples/skyrim-full.tsv
+examples/skyrim-singleword.tsv
+
+# Editor lock/backup files
+.#*
+*~
