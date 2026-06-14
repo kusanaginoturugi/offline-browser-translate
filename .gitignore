@@ -11,6 +11,7 @@ examples/skyrim-other.tsv
 examples/skyrim-other-multi.tsv
 examples/skyrim-other-single.tsv
 examples/skyrim-other-single-verbs.tsv
+examples/skyrim-final.tsv
 
 # Editor lock/backup files
 .#*
