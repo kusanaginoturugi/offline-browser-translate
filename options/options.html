@@ -173,6 +173,9 @@
                     <label for="useTranslationCache">Cache translations</label>
                     <p class="hint">Remember translated text so identical segments aren't re-translated. Cached per model and language pair.</p>
                     <button id="clearCache" class="secondary-btn">🗑️ Clear translation cache</button>
+                    <p class="hint">Cached entries per model. Delete a model's cache to free space after trying a bad model.</p>
+                    <div id="cacheStats" class="cache-stats"></div>
+                    <button id="clearOtherModels" class="secondary-btn">🧹 Delete all except current model</button>
                 </div>
 
             </section>

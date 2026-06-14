@@ -421,6 +421,31 @@ button {
     background: var(--bg-tertiary);
 }
 
+.cache-stats {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.cache-stat-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.cache-stat-label {
+    overflow-wrap: anywhere;
+}
+
+.cache-stat-row .secondary-btn {
+    flex: none;
+    padding: 2px 8px;
+}
+
 .danger-btn {
     background: transparent;
     color: var(--red);

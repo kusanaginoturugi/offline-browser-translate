@@ -95,6 +95,8 @@ const elements = {
     debugLogging: document.getElementById('debugLogging'),
     useTranslationCache: document.getElementById('useTranslationCache'),
     clearCache: document.getElementById('clearCache'),
+    cacheStats: document.getElementById('cacheStats'),
+    clearOtherModels: document.getElementById('clearOtherModels'),
     useGlossary: document.getElementById('useGlossary'),
     glossaryFile: document.getElementById('glossaryFile'),
     glossaryStatus: document.getElementById('glossaryStatus'),
@@ -177,6 +179,7 @@ async function init() {
     await loadModels();
     setupEventListeners();
     refreshGlossaryStatus();
+    refreshCacheStats();
 }
 
 // Load available models from providers
@@ -408,6 +411,51 @@ async function refreshGlossaryStatus() {
     }
 }
 
+// Show per-model cache counts with a delete button for each model.
+async function refreshCacheStats() {
+    if (!elements.cacheStats) return;
+    let stats = [];
+    try {
+        const res = await browserAPI.runtime.sendMessage({ type: 'GET_CACHE_STATS' });
+        stats = (res && res.stats) || [];
+    } catch (e) { /* leave empty */ }
+
+    elements.cacheStats.innerHTML = '';
+    if (!stats.length) {
+        elements.cacheStats.textContent = 'Cache is empty.';
+        return;
+    }
+
+    const current = currentSettings.selectedModel || '';
+    for (const { model, count } of stats) {
+        const row = document.createElement('div');
+        row.className = 'cache-stat-row';
+
+        const label = document.createElement('span');
+        label.className = 'cache-stat-label';
+        const isCurrent = model === current;
+        label.textContent = `${model} — ${count} ${count === 1 ? 'entry' : 'entries'}${isCurrent ? ' (current)' : ''}`;
+
+        const btn = document.createElement('button');
+        btn.className = 'secondary-btn';
+        btn.textContent = '🗑️';
+        btn.title = `Delete cached translations for ${model}`;
+        btn.addEventListener('click', async () => {
+            const res = await browserAPI.runtime.sendMessage({ type: 'CLEAR_MODEL_CACHE', model });
+            if (res && res.ok) {
+                showToast(`Cleared ${res.removed} ${res.removed === 1 ? 'entry' : 'entries'} for ${model}`);
+                await refreshCacheStats();
+            } else {
+                showToast('Failed to clear cache', 'error');
+            }
+        });
+
+        row.appendChild(label);
+        row.appendChild(btn);
+        elements.cacheStats.appendChild(row);
+    }
+}
+
 // Show toast notification
 function showToast(message, type = 'success', duration = 3000) {
     const toast = elements.toast;
@@ -484,8 +532,25 @@ function setupEventListeners() {
     if (elements.clearCache) {
         elements.clearCache.addEventListener('click', async () => {
             const res = await browserAPI.runtime.sendMessage({ type: 'CLEAR_TRANSLATION_CACHE' });
-            if (res && res.ok) showToast('Translation cache cleared');
-            else showToast('Failed to clear cache', 'error');
+            if (res && res.ok) {
+                showToast('Translation cache cleared');
+                await refreshCacheStats();
+            } else {
+                showToast('Failed to clear cache', 'error');
+            }
+        });
+    }
+
+    // Delete every model's cache except the one currently in use
+    if (elements.clearOtherModels) {
+        elements.clearOtherModels.addEventListener('click', async () => {
+            const res = await browserAPI.runtime.sendMessage({ type: 'CLEAR_OTHER_MODELS_CACHE' });
+            if (res && res.ok) {
+                showToast(`Cleared ${res.removed} ${res.removed === 1 ? 'entry' : 'entries'}, kept ${res.kept}`);
+                await refreshCacheStats();
+            } else {
+                showToast(res && res.error ? res.error : 'Failed to clear cache', 'error');
+            }
         });
     }
 
