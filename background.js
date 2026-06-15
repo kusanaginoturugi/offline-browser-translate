@@ -37,7 +37,8 @@ const DEFAULT_SETTINGS = {
     numCtx: 0,          // Ollama context window size (0 = model default)
     debug: false,       // Enable verbose logging
     floatingButton: false, // Show floating translate button on text selection (requires <all_urls> permission)
-    useTranslationCache: true // Remember translated segments and skip re-translating identical text
+    useTranslationCache: true, // Remember translated segments and skip re-translating identical text
+    useGlossary: true   // Inject matching glossary terms into the prompt for consistent proper-noun translation
 };
 
 let debugEnabled = false;
@@ -186,6 +187,167 @@ async function clearTranslationCache() {
     }
 }
 
+// Group cached entries by model. The cache key is
+// `${modelId}\0${sourceLang}\0${targetLang}\0${text}`, so the model is the first
+// null-delimited token.
+async function cacheStatsByModel() {
+    const cache = await loadTranslationCache();
+    const counts = new Map();
+    for (const key of cache.keys()) {
+        const sp = key.indexOf('\0');
+        const model = sp === -1 ? key : key.slice(0, sp);
+        counts.set(model, (counts.get(model) || 0) + 1);
+    }
+    return [...counts.entries()]
+        .map(([model, count]) => ({ model, count }))
+        .sort((a, b) => b.count - a.count);
+}
+
+// Remove cached translations matching a model filter. `keep` true removes every
+// entry EXCEPT the given model (used to wipe experimental models, keeping the one
+// in use); `keep` false removes only that model's entries.
+async function clearModelCache(model, keep = false) {
+    if (!model) return 0;
+    const cache = await loadTranslationCache();
+    const prefix = `${model}\0`;
+    let removed = 0;
+    for (const key of [...cache.keys()]) {
+        const matches = key.startsWith(prefix);
+        if (keep ? !matches : matches) { cache.delete(key); removed++; }
+    }
+    if (removed) {
+        try {
+            await browserAPI.storage.local.set({
+                [TRANSLATION_CACHE_KEY]: [...cache.entries()]
+            });
+        } catch (e) {
+            console.error('Failed to save translation cache:', e);
+        }
+    }
+    return removed;
+}
+
+// ============================================================================
+// Glossary
+// User-supplied proper-noun dictionary. Only terms that actually appear in the
+// batch being translated are injected into the prompt, so the dictionary itself
+// can be large (tens of thousands of entries) without bloating requests.
+//
+// Stored in storage.local under 'glossary' as an array of [source, target]
+// pairs. An empty/identical target means "keep as-is" (do not translate).
+// Matching is case-sensitive and Latin word-boundary aware (proper nouns); an
+// Aho-Corasick automaton is built lazily so a batch is scanned in one pass.
+// ============================================================================
+
+const GLOSSARY_KEY = 'glossary';
+const GLOSSARY_MAX_HITS = 40;   // cap terms injected per batch to keep prompts small
+
+let glossaryEntries = null;     // Array<[source, target]>, lazily loaded
+let glossaryAutomaton = null;   // built Aho-Corasick root, or null
+
+async function loadGlossary() {
+    if (glossaryEntries) return glossaryEntries;
+    try {
+        const result = await browserAPI.storage.local.get(GLOSSARY_KEY);
+        const entries = result[GLOSSARY_KEY];
+        glossaryEntries = Array.isArray(entries) ? entries : [];
+    } catch (e) {
+        console.error('Failed to load glossary:', e);
+        glossaryEntries = [];
+    }
+    glossaryAutomaton = null;
+    return glossaryEntries;
+}
+
+// Reset in-memory glossary so the next translate reloads it. Called after the
+// user replaces or clears the dictionary.
+function invalidateGlossary() {
+    glossaryEntries = null;
+    glossaryAutomaton = null;
+}
+
+function isWordChar(c) {
+    return c !== '' && c !== undefined && /[\p{L}\p{N}_]/u.test(c);
+}
+
+// Build an Aho-Corasick automaton over the source strings (case-sensitive,
+// UTF-16 unit granularity — fine for Latin proper nouns).
+function buildGlossaryAutomaton(entries) {
+    const root = { next: new Map(), fail: null, out: [] };
+    for (let i = 0; i < entries.length; i++) {
+        const pat = entries[i] && entries[i][0];
+        if (!pat) continue;
+        let node = root;
+        for (let j = 0; j < pat.length; j++) {
+            const ch = pat[j];
+            let child = node.next.get(ch);
+            if (!child) { child = { next: new Map(), fail: null, out: [] }; node.next.set(ch, child); }
+            node = child;
+        }
+        node.out.push(i);
+    }
+    const queue = [];
+    for (const child of root.next.values()) { child.fail = root; queue.push(child); }
+    while (queue.length) {
+        const node = queue.shift();
+        for (const [ch, child] of node.next) {
+            let f = node.fail;
+            while (f && !f.next.has(ch)) f = f.fail;
+            child.fail = (f && f.next.get(ch)) || root;
+            if (child.fail.out.length) child.out = child.out.concat(child.fail.out);
+            queue.push(child);
+        }
+    }
+    return root;
+}
+
+// Find glossary entries that occur in `text`. Returns an array of entry indices,
+// deduped, in first-seen order, capped at GLOSSARY_MAX_HITS. A Latin match is
+// rejected when it sits inside a larger word (e.g. "Container" in "Containers").
+function scanGlossary(root, entries, text) {
+    const seen = new Set();
+    const order = [];
+    let node = root;
+    for (let i = 0; i < text.length && order.length < GLOSSARY_MAX_HITS; i++) {
+        const ch = text[i];
+        while (node !== root && !node.next.has(ch)) node = node.fail;
+        node = node.next.get(ch) || root;
+        if (!node.out.length) continue;
+        for (const idx of node.out) {
+            if (seen.has(idx)) continue;
+            const pat = entries[idx][0];
+            const end = i + 1;
+            const start = end - pat.length;
+            const before = start > 0 ? text[start - 1] : '';
+            const after = end < text.length ? text[end] : '';
+            const cutStart = isWordChar(before) && isWordChar(pat[0]);
+            const cutEnd = isWordChar(after) && isWordChar(pat[pat.length - 1]);
+            if (cutStart || cutEnd) continue;
+            seen.add(idx);
+            order.push(idx);
+            if (order.length >= GLOSSARY_MAX_HITS) break;
+        }
+    }
+    return order;
+}
+
+// Build the glossary instruction block for the terms found in `text`. Returns ''
+// when the glossary is empty or nothing matches, so prompts are unchanged.
+async function buildGlossaryBlock(settings, text) {
+    if (settings.useGlossary === false) return '';
+    const entries = await loadGlossary();
+    if (!entries.length) return '';
+    if (!glossaryAutomaton) glossaryAutomaton = buildGlossaryAutomaton(entries);
+    const hits = scanGlossary(glossaryAutomaton, entries, text);
+    if (!hits.length) return '';
+    const lines = hits.map(idx => {
+        const [src, tgt] = entries[idx];
+        const target = (tgt === undefined || tgt === '') ? src : tgt;
+        return `- "${src}" => "${target}"`;
+    });
+    return `[Glossary] Use these exact translations for the listed terms. Keep them consistent and do not alter them:\n${lines.join('\n')}`;
+}
+
 // ============================================================================
 // Provider Detection & Model Listing
 // ============================================================================
@@ -332,79 +494,6 @@ function buildPrompt(template, vars) {
     return result;
 }
 
-// ============================================================================
-// Proper-noun glossary
-// ============================================================================
-//
-// We force preferred translations of proper nouns by masking each source term
-// in the text with a placeholder token before sending it to the model, then
-// restoring the token to the desired target after translation. This keeps the
-// names intact regardless of how well the model follows instructions, so it
-// works even with rigid translate-only models like TranslateGemma.
-
-function escapeRegExp(s) {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// Parse the glossary textarea into [{ source, target }] pairs.
-// Format: one "source=target" per line; blank lines and #-comments ignored.
-// Sorted longest source first so multi-word terms mask before their substrings.
-function parseGlossary(text) {
-    if (!text) return [];
-    const pairs = [];
-    for (const rawLine of String(text).split('\n')) {
-        const line = rawLine.trim();
-        if (!line || line.startsWith('#')) continue;
-        const eq = line.indexOf('=');
-        if (eq <= 0) continue;
-        const source = line.slice(0, eq).trim();
-        const target = line.slice(eq + 1).trim();
-        if (source && target) pairs.push({ source, target });
-    }
-    pairs.sort((a, b) => b.source.length - a.source.length);
-    return pairs;
-}
-
-// Private-use bracket characters around an index: very unlikely to be altered
-// or translated by the model, and easy to restore verbatim afterwards.
-function glossaryToken(i) {
-    return `${i}`;
-}
-
-// Replace glossary source terms in `text` with placeholder tokens.
-// Returns { masked, map } where map maps each token to its target translation,
-// or map === null when nothing matched.
-function maskGlossary(text, pairs, mode) {
-    if (!text || !pairs.length) return { masked: text, map: null };
-    let masked = text;
-    const map = {};
-    let idx = 0;
-    for (const { source, target } of pairs) {
-        const body = escapeRegExp(source);
-        const pattern = mode === 'word'
-            ? new RegExp(`\\b${body}\\b`, 'gi')
-            : new RegExp(body, 'gi');
-        const token = glossaryToken(idx);
-        const replaced = masked.replace(pattern, token);
-        if (replaced !== masked) {
-            masked = replaced;
-            map[token] = target;
-            idx++;
-        }
-    }
-    return { masked, map: idx ? map : null };
-}
-
-// Restore placeholder tokens in translated text back to glossary targets.
-function unmaskGlossary(text, map) {
-    if (!text || !map) return text;
-    let out = text;
-    for (const [token, target] of Object.entries(map)) {
-        out = out.split(token).join(target);
-    }
-    return out;
-}
-
 // A small allowlist of inline HTML tags that occasionally leak from models.
 // We only strip these — arbitrary "<...>" is left alone so legitimate text like
 // "a < b" or "<3" is never mangled.
@@ -443,6 +532,8 @@ function isSuspiciousTranslation(text) {
 
 // Extract the first balanced {...} object from a string, respecting strings and
 // escapes. More reliable than a greedy regex when the model adds prose around it.
+// JSON schema for the batched translation response. The inner shape is shared:
+// Ollama wants the bare schema in `format`, LMStudio/OpenAI want it wrapped.
 function extractJsonObject(text) {
     const start = text.indexOf('{');
     if (start === -1) return null;
@@ -518,7 +609,6 @@ function parseTranslationResponse(response, originalItems) {
         const idsMismatch = !llmIds.some(id => ourIds.includes(id));
 
         if (llmUsedSequential || idsMismatch) {
-            // console.log('[Background] LLM used sequential IDs, remapping to original IDs');
             // Map sequential LLM IDs to our original IDs
             translations = translations.map((t, index) => ({
                 id: originalItems[index]?.id ?? t.id,
@@ -675,8 +765,6 @@ async function callOllama(settings, modelId, systemPrompt, userPrompt, jsonOutpu
     return data.response;
 }
 
-
-
 // JSON schema for the batched translation response. The inner shape is shared:
 // Ollama wants the bare schema in `format`, LMStudio/OpenAI want it wrapped.
 const TRANSLATION_JSON_SCHEMA = {
@@ -698,6 +786,7 @@ const TRANSLATION_JSON_SCHEMA = {
     "required": ["translations"],
     "additionalProperties": false
 };
+
 async function callLMStudio(settings, modelId, systemPrompt, userPrompt, jsonOutput, cancelSignal) {
     const messages = [];
 
@@ -824,8 +913,13 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
         const mappedItems = items.map((item, index) => ({ id: index, text: item.text, originalId: item.id }));
         
         const vars = { ...baseVars, texts: formatTextsForPrompt(mappedItems) };
-        const userPrompt = buildPrompt(userTemplate, vars);
+        let userPrompt = buildPrompt(userTemplate, vars);
         const systemPrompt = buildPrompt(systemTemplate, vars);
+
+        // Prepend matching glossary terms so the model keeps proper nouns
+        // consistent. Empty when the glossary is off/unmatched (prompt unchanged).
+        const glossaryBlock = await buildGlossaryBlock(settings, mappedItems.map(m => m.text).join('\n'));
+        if (glossaryBlock) userPrompt = `${glossaryBlock}\n\n${userPrompt}`;
         const raw = await callProvider(provider, settings, modelId, systemPrompt, userPrompt, wantJson, cancelSignal);
         debugLog(`[Background] Raw LLM response (first 300 chars):`, (raw || '').substring(0, 300));
         
@@ -981,6 +1075,51 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     break;
 
                 case 'CLEAR_TRANSLATION_CACHE':
+                    await clearTranslationCache();
+                    sendResponse({ ok: true });
+                    break;
+
+                case 'GET_CACHE_STATS':
+                    sendResponse({ stats: await cacheStatsByModel() });
+                    break;
+
+                case 'CLEAR_MODEL_CACHE': {
+                    const removed = await clearModelCache(message.model);
+                    sendResponse({ ok: true, removed });
+                    break;
+                }
+
+                case 'CLEAR_OTHER_MODELS_CACHE': {
+                    const keepModel = settings.selectedModel;
+                    if (!keepModel) {
+                        sendResponse({ ok: false, error: 'No current model selected' });
+                        break;
+                    }
+                    const removed = await clearModelCache(keepModel, true);
+                    sendResponse({ ok: true, removed, kept: keepModel });
+                    break;
+                }
+
+                case 'SAVE_GLOSSARY': {
+                    // entries: Array<[source, target]> already parsed by the options page.
+                    const entries = Array.isArray(message.entries) ? message.entries : [];
+                    await browserAPI.storage.local.set({ [GLOSSARY_KEY]: entries });
+                    invalidateGlossary();
+                    // Glossary changes the output for the same source text — drop stale cache.
+                    await clearTranslationCache();
+                    sendResponse({ ok: true, count: entries.length });
+                    break;
+                }
+
+                case 'GET_GLOSSARY_INFO': {
+                    const entries = await loadGlossary();
+                    sendResponse({ count: entries.length });
+                    break;
+                }
+
+                case 'CLEAR_GLOSSARY':
+                    await browserAPI.storage.local.remove(GLOSSARY_KEY);
+                    invalidateGlossary();
                     await clearTranslationCache();
                     sendResponse({ ok: true });
                     break;

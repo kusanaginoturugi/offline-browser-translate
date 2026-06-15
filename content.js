@@ -83,12 +83,14 @@ const MIN_TEXT_LENGTH = 2;
  */
 function shouldSkipElement(element) {
     if (!element || !element.tagName) return true;
-    if (SKIP_TAGS.has(element.tagName)) return true;
     if (element.isContentEditable) return true;
-    
-    // Check ancestors recursively for translate="no" or our extension elements
+
+    // Check element and ancestors for SKIP_TAGS, translate="no", or our extension elements
     let curr = element;
     while (curr) {
+        if (curr.tagName && SKIP_TAGS.has(curr.tagName)) {
+            return true;
+        }
         if (curr.getAttribute && curr.getAttribute('translate') === 'no') {
             return true;
         }
@@ -113,6 +115,45 @@ function isTranslatableText(text) {
     // Use Unicode-aware check - look for any letter character
     const hasLetters = /\p{L}/u.test(trimmed);
     return hasLetters;
+}
+
+/**
+ * Map a target language code to a regex matching its writing system.
+ * Used to skip text that is already written in the target script, so a
+ * mixed-language page only sends the parts that still need translating.
+ * Latin-script targets (en, es, fr, ...) are intentionally absent: telling
+ * two Latin-script languages apart needs real language detection.
+ */
+const TARGET_SCRIPT_PATTERNS = {
+    ja: /[\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}]/u,
+    zh: /\p{sc=Han}/u,
+    ko: /\p{sc=Hangul}/u,
+    ru: /\p{sc=Cyrillic}/u,
+    uk: /\p{sc=Cyrillic}/u,
+    bg: /\p{sc=Cyrillic}/u,
+    sr: /\p{sc=Cyrillic}/u,
+    ar: /\p{sc=Arabic}/u,
+    fa: /\p{sc=Arabic}/u,
+    he: /\p{sc=Hebrew}/u,
+    el: /\p{sc=Greek}/u,
+    th: /\p{sc=Thai}/u,
+    hi: /\p{sc=Devanagari}/u
+};
+
+/**
+ * True if `text` is already predominantly written in the target language's
+ * script, so re-translating it is wasted work and risks corrupting it.
+ * Returns false for unknown / Latin-script targets (we don't guess).
+ */
+function isAlreadyTargetScript(text) {
+    const code = (currentTargetLanguage || '').toLowerCase().split('-')[0];
+    const scriptRe = TARGET_SCRIPT_PATTERNS[code];
+    if (!scriptRe) return false;
+    const letters = text.match(/\p{L}/gu);
+    if (!letters || letters.length === 0) return false;
+    let inScript = 0;
+    for (const ch of letters) if (scriptRe.test(ch)) inScript++;
+    return inScript / letters.length >= 0.7;
 }
 
 /**
@@ -181,7 +222,7 @@ function registerTextNode(node) {
         ? splitIntoSentences(originalText) : [originalText];
 
     for (const rawSeg of rawSegments) {
-        if (isTranslatableText(rawSeg)) {
+        if (isTranslatableText(rawSeg) && !isAlreadyTargetScript(rawSeg)) {
             const segmentId = nextSegmentId++;
             segmentToNodeIdMap.set(segmentId, nodeId);
             segments.push({

@@ -1,0 +1,52 @@
+# Skyrim 固有名詞グロッサリ（サンプル）
+# 形式: source<TAB>translation  （2列目を省略すると「訳さず維持」）
+# '#' 始まりと空行は無視される。大文字小文字は区別する。
+# 訳語は要確認。公式日本語版の表記に合わせて適宜直すこと。
+
+# --- 地名 (Holds / Cities) ---
+Skyrim	スカイリム
+Whiterun	ホワイトラン
+Solitude	ソリチュード
+Windhelm	ウィンドヘルム
+Riften	リフテン
+Markarth	マルカルス
+Falkreath	ファルクリース
+Morthal	モーサル
+Dawnstar	ドーンスター
+Winterhold	ウィンターホールド
+Riverwood	リバーウッド
+Ivarstead	イヴァルステッド
+High Hrothgar	ハイ・フロスガー
+Tamriel	タムリエル
+Sovngarde	ソブンガルデ
+Blackreach	ブラックリーチ
+
+# --- 人物 (Characters) ---
+Dragonborn	ドラゴンボーン
+Alduin	アルドゥイン
+Paarthurnax	パーサーナックス
+Ulfric Stormcloak	ウルフリック・ストームクローク
+Esbern	エズバーン
+Delphine	デルフィン
+Lydia	リディア
+Tullius	タリウス
+
+# --- 勢力 (Factions) ---
+Stormcloaks	ストームクローク
+Thalmor	サルモール
+The Companions	同胞団
+Dark Brotherhood	闇の一党
+College of Winterhold	ウィンターホールド大学
+
+# --- 種族・用語 (Races / Terms) ---
+Dovahkiin	ドヴァキン
+Thu'um	スゥーム
+Dwemer	ドゥーマー
+Daedric	デイドラ
+Septim	セプティム
+Sweetroll	スイートロール
+
+# --- 「訳さず維持」する例 (2列目なし) ---
+Nexus
+SKSE
+Creation Kit
