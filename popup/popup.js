@@ -42,6 +42,8 @@ const elements = {
     translateBtn: document.getElementById('translateBtn'),
     cancelBtn: document.getElementById('cancelBtn'),
     restoreBtn: document.getElementById('restoreBtn'),
+    retranslateSelectionBtn: document.getElementById('retranslateSelectionBtn'),
+    discardSelectionBtn: document.getElementById('discardSelectionBtn'),
     toggleAdvanced: document.getElementById('toggleAdvanced'),
     advancedSection: document.getElementById('advancedSection'),
     providerSelect: document.getElementById('providerSelect'),
@@ -512,6 +514,90 @@ async function saveCurrentSettings() {
     });
 }
 
+function assertTranslatableTab(tab) {
+    if (!tab || !tab.id) {
+        throw new Error('No active tab found');
+    }
+    if (tab.url && (tab.url.startsWith('about:') || tab.url.startsWith('chrome:') ||
+        tab.url.startsWith('moz-extension:') || tab.url.startsWith('chrome-extension:'))) {
+        throw new Error('Cannot translate browser internal pages.');
+    }
+}
+
+async function ensureContentScript(tab) {
+    try {
+        await browserAPI.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ['/content.js']
+        });
+    } catch (injectErr) {
+        debugLog('[Popup] Script injection note:', injectErr.message);
+    }
+
+    for (let i = 0; i < 15; i++) {
+        try {
+            const resp = await browserAPI.tabs.sendMessage(tab.id, { type: 'PING' });
+            if (resp && resp.pong) return;
+        } catch { }
+        await new Promise(r => setTimeout(r, 100));
+    }
+
+    throw new Error('Could not connect to page. Try refreshing the page first.');
+}
+
+function resolveSourceLanguage() {
+    if (currentSettings.sourceLanguage && currentSettings.sourceLanguage !== 'auto') {
+        return currentSettings.sourceLanguage;
+    }
+    return detectedPageLanguage || 'auto';
+}
+
+async function runSelectionCommand(type) {
+    const model = elements.modelSelect.value;
+    if (!model && type !== 'DISCARD_SELECTION_TRANSLATION') {
+        showToast('Please select a model first', 'error');
+        return;
+    }
+
+    if (!providersAvailable && type !== 'DISCARD_SELECTION_TRANSLATION') {
+        showToast('No LLM provider running. Start Ollama or LMStudio first.', 'error');
+        return;
+    }
+
+    const activeButton = type === 'RETRANSLATE_SELECTION'
+        ? elements.retranslateSelectionBtn
+        : elements.discardSelectionBtn;
+    activeButton.disabled = true;
+
+    try {
+        await saveCurrentSettings();
+        const [tab] = await browserAPI.tabs.query({ active: true, currentWindow: true });
+        assertTranslatableTab(tab);
+        await ensureContentScript(tab);
+
+        const response = await browserAPI.tabs.sendMessage(tab.id, {
+            type,
+            targetLanguage: currentSettings.targetLanguage,
+            sourceLanguage: resolveSourceLanguage(),
+            showGlow: currentSettings.showGlow,
+            maxConcurrentRequests: currentSettings.maxConcurrentRequests || 4
+        });
+
+        if (response?.error) {
+            throw new Error(response.error);
+        }
+
+        showToast(type === 'RETRANSLATE_SELECTION'
+            ? 'Retranslating selected text'
+            : 'Discarded selected translation');
+    } catch (e) {
+        console.error('Selection action error:', e);
+        showToast(`Error: ${e.message}`, 'error');
+    } finally {
+        activeButton.disabled = false;
+    }
+}
+
 // Start translation
 async function startTranslation() {
     if (isTranslating) return;
@@ -659,6 +745,19 @@ function setupEventListeners() {
 
     // Restore/Toggle button
     elements.restoreBtn.addEventListener('click', toggleTranslation);
+
+    // Selection repair actions
+    if (elements.retranslateSelectionBtn) {
+        elements.retranslateSelectionBtn.addEventListener('click', () => {
+            runSelectionCommand('RETRANSLATE_SELECTION');
+        });
+    }
+
+    if (elements.discardSelectionBtn) {
+        elements.discardSelectionBtn.addEventListener('click', () => {
+            runSelectionCommand('DISCARD_SELECTION_TRANSLATION');
+        });
+    }
 
     // Refresh models
     elements.refreshModels.addEventListener('click', async () => {

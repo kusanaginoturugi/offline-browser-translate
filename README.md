@@ -12,6 +12,7 @@ A privacy-focused browser extension that translates web pages using local LLMs (
 - 🎯 **Smart Prioritization** - Visible content and headings are translated first
 - 🌍 **Many Languages** - Supports many many languages :3
 - ⚡ **Translation Cache** - Remembers translated text so identical segments (menus, buttons, nav) aren't re-translated, even across reloads and other pages
+- 🛠️ **Selection Repair** - Retranslate a bad selected segment or discard its cached translation and restore the original text
 
 ## Requirements
 
@@ -67,6 +68,53 @@ The extension will:
 - Translate in batches with progress percentage
 - Auto-translate new content (infinite scroll)
 
+### Fixing a Bad Translation
+
+If a small part of the page is translated badly:
+
+1. Select the bad translated text on the page
+2. Open the extension popup
+3. Click **Retranslate Selection** to force a fresh translation
+4. Click **Discard Selection** to restore the original text and forget that cached translation
+
+Selection actions work on the extension's internal sentence/text segments. Long text is usually handled sentence by sentence; short UI text may be restored or retranslated as one text-node segment.
+
+## Benchmarking
+
+Use `scripts/benchmark.rb` to measure local LLM translation speed with a fixed
+8-segment input set. This measures provider/API translation throughput, not
+browser DOM replacement time.
+
+```sh
+PROVIDER=ollama MODEL=translategemma:4b TARGET_LANGUAGE=Japanese ./scripts/benchmark.rb
+```
+
+Recommended reporting:
+
+- Use one warmup run and at least three measured runs (the script default)
+- Record the model, provider, target language, wall time, source characters/sec,
+  and output tokens/sec
+- Keep the benchmark input unchanged when comparing models or machines
+
+### Local Reference
+
+Measured on 2026-06-24 with Ollama, English -> Japanese, 8 segments / 584 source
+characters. These are reference numbers for this machine, not a guarantee for
+other pages; real page translation also depends on DOM size, cache hits, and
+parallel request settings.
+
+Machine:
+
+- OS: `Linux 7.0.12-zen1-1.1-zen x86_64 GNU/Linux`
+- CPU: AMD Ryzen 7 3700X 8-Core Processor / 16 threads
+- RAM: 31.3 GiB
+- GPU: NVIDIA GeForce RTX 3060, 12 GiB VRAM, driver 610.43.02
+
+| Model | Avg wall time | Source chars/s | Avg output tokens/s |
+|-------|---------------|----------------|---------------------|
+| `translategemma:4b` | 4.12 s | 145.1 | 75.4 |
+| `translategemma:12b` | 7.29 s | 80.1 | 34.3 |
+
 ## Privacy
 
 This extension is designed to be privacy-focused:
@@ -89,6 +137,7 @@ Click **Advanced Settings** to configure:
 | Request Format (*work in progress*) | Default JSON, Hunyuan-MT, Simple, or Custom |
 | Show Glow | Toggle visual indicator on translated text |
 | Cache translations | Remember translated text and skip re-translating identical segments (cached per model + language pair); includes a button to clear the cache |
+| Retranslate/Discard Selection | Repair selected bad translations from the popup. Retranslate clears the matching cache entry first; discard restores original text and removes the cached result |
 
 ## File Structure
 
@@ -96,6 +145,8 @@ Click **Advanced Settings** to configure:
 ├── manifest.json      # Extension manifest (MV3)
 ├── background.js      # Background script (LLM API, settings)
 ├── content.js         # Content script (DOM manipulation)
+├── scripts/
+│   └── benchmark.rb   # Local provider translation benchmark
 ├── popup/
 │   ├── popup.html     # Popup UI
 │   ├── popup.css      # Styles (Everforest Dark theme)

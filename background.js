@@ -227,6 +227,27 @@ async function clearModelCache(model, keep = false) {
     return removed;
 }
 
+async function clearCacheEntries(modelId, sourceLang, targetLang, texts) {
+    if (!modelId || !targetLang || !Array.isArray(texts) || texts.length === 0) return 0;
+    const cache = await loadTranslationCache();
+    const source = sourceLang && sourceLang !== 'auto' ? sourceLang : 'en';
+    let removed = 0;
+    for (const text of texts) {
+        const key = makeCacheKey(modelId, source, targetLang, text);
+        if (cache.delete(key)) removed++;
+    }
+    if (removed) {
+        try {
+            await browserAPI.storage.local.set({
+                [TRANSLATION_CACHE_KEY]: [...cache.entries()]
+            });
+        } catch (e) {
+            console.error('Failed to save translation cache:', e);
+        }
+    }
+    return removed;
+}
+
 // ============================================================================
 // Glossary
 // User-supplied proper-noun dictionary. Only terms that actually appear in the
@@ -1097,6 +1118,17 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     }
                     const removed = await clearModelCache(keepModel, true);
                     sendResponse({ ok: true, removed, kept: keepModel });
+                    break;
+                }
+
+                case 'CLEAR_TRANSLATION_CACHE_ENTRIES': {
+                    const removed = await clearCacheEntries(
+                        settings.selectedModel,
+                        message.sourceLanguage || settings.sourceLanguage,
+                        message.targetLanguage || settings.targetLanguage,
+                        message.texts
+                    );
+                    sendResponse({ ok: true, removed });
                     break;
                 }
 
