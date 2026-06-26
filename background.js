@@ -706,15 +706,21 @@ async function translate(textItems, targetLanguage, settings) {
 
     // Serve cache hits up front; only unresolved uniques go to the model.
     let uniqueItems = uniqueItems0;
-    let cacheHitCount = 0;
+    let cacheHitCount = 0;      // unique source strings served from cache
+    let fromCacheItems = 0;     // text elements served from cache (incl. duplicates)
     if (cacheEnabled) {
         try {
             const found = await cacheGetMany(uniqueItems0.map(it => keyFor(it.text)));
             const misses = [];
             for (const it of uniqueItems0) {
                 const cached = found.get(keyFor(it.text));
-                if (cached !== undefined) { results.set(it.id, cached); cacheHitCount++; }
-                else misses.push(it);
+                if (cached !== undefined) {
+                    results.set(it.id, cached);
+                    cacheHitCount++;
+                    fromCacheItems += idsForRep.get(it.id).length;
+                } else {
+                    misses.push(it);
+                }
             }
             uniqueItems = misses;
         } catch (e) {
@@ -780,9 +786,10 @@ async function translate(textItems, targetLanguage, settings) {
 
     // Build the final array in original order. Items that never succeeded are
     // returned with an error so the content script keeps their original text.
-    return textItems.map(item => results.has(item.id)
+    const translations = textItems.map(item => results.has(item.id)
         ? { id: item.id, text: results.get(item.id) }
         : { id: item.id, error: 'translation failed' });
+    return { translations, fromCache: fromCacheItems, total: textItems.length };
 }
 
 // ============================================================================
@@ -867,12 +874,16 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                         };
                     }
 
-                    const translations = await translate(
+                    const result = await translate(
                         message.texts,
                         message.targetLanguage,
                         settingsWithSource
                     );
-                    sendResponse({ translations });
+                    sendResponse({
+                        translations: result.translations,
+                        fromCache: result.fromCache,
+                        total: result.total
+                    });
                     break;
 
                 case 'CLEAR_CACHE':

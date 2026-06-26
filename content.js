@@ -482,6 +482,10 @@ function restoreCachedTranslations() {
 /**
  * Show translation status indicator
  */
+// Secondary status line (e.g. cache hit stats), rendered under the main message.
+// Kept in module state so every code path that calls showStatus shows it.
+let statusDetailText = '';
+
 function showStatus(message, isError = false) {
     let statusEl = document.getElementById('llm-translator-status');
 
@@ -501,14 +505,64 @@ function showStatus(message, isError = false) {
       box-shadow: 0 4px 12px rgba(0,0,0,0.15);
       transition: opacity 0.3s, transform 0.3s;
     `;
+        const mainLine = document.createElement('div');
+        mainLine.className = 'llm-status-main';
+        const detailLine = document.createElement('div');
+        detailLine.className = 'llm-status-detail';
+        detailLine.style.cssText = 'font-size: 12px; opacity: 0.8; margin-top: 4px;';
+        detailLine.style.display = 'none';
+        statusEl.appendChild(mainLine);
+        statusEl.appendChild(detailLine);
         document.body.appendChild(statusEl);
     }
 
     statusEl.style.backgroundColor = isError ? '#E67E80' : '#A7C080';
     statusEl.style.color = '#1E2326';
-    statusEl.textContent = message;
+    if (isError) statusDetailText = '';
+    statusEl.querySelector('.llm-status-main').textContent = message;
+    renderStatusDetail(statusEl);
     statusEl.style.opacity = '1';
     statusEl.style.transform = 'translateY(0)';
+}
+
+// Render the secondary status line from statusDetailText (hidden when empty).
+function renderStatusDetail(statusEl) {
+    statusEl = statusEl || document.getElementById('llm-translator-status');
+    if (!statusEl) return;
+    const detailEl = statusEl.querySelector('.llm-status-detail');
+    if (!detailEl) return;
+    detailEl.textContent = statusDetailText;
+    detailEl.style.display = statusDetailText ? 'block' : 'none';
+}
+
+// Set the secondary status line and re-render it without touching the main line.
+function setStatusDetail(text) {
+    statusDetailText = text || '';
+    renderStatusDetail();
+}
+
+// Running cache stats for the current translation session.
+let cacheHitsTotal = 0;
+let cacheItemsTotal = 0;
+
+function resetCacheStats() {
+    cacheHitsTotal = 0;
+    cacheItemsTotal = 0;
+}
+
+// Build the "served from cache" line, or '' when nothing has been processed yet.
+function cacheStatsLine() {
+    if (cacheItemsTotal <= 0) return '';
+    const pct = Math.round((cacheHitsTotal / cacheItemsTotal) * 100);
+    return `⚡ ${cacheHitsTotal}/${cacheItemsTotal} from cache (${pct}%)`;
+}
+
+// Fold one batch's cache numbers into the running totals and refresh the line.
+function recordCacheStats(result) {
+    if (!result) return;
+    cacheHitsTotal += result.fromCache || 0;
+    cacheItemsTotal += (typeof result.total === 'number') ? result.total : 0;
+    setStatusDetail(cacheStatsLine());
 }
 
 /**
@@ -611,7 +665,12 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
                 console.warn(`[Translator] ${failed.length} items failed in this batch`);
             }
 
-            return { applied, failed };
+            return {
+                applied,
+                failed,
+                fromCache: response.fromCache || 0,
+                total: (typeof response.total === 'number') ? response.total : textItems.length
+            };
 
         } catch (e) {
             lastError = e;
@@ -627,7 +686,7 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
 
     // All retries failed - return all items as failed
     console.error(`[Translator] All retries failed for batch of ${textItems.length} items. Last error: ${lastError?.message}`);
-    return { applied: 0, failed: textItems };
+    return { applied: 0, failed: textItems, fromCache: 0, total: textItems.length };
 }
 
 
@@ -657,6 +716,7 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
     currentTargetLanguage = targetLanguage;
     translationInProgress = true;
     translationCancelled = false;
+    resetCacheStats();
     showStatus('Extracting text...');
 
     // Add scroll listener for dynamic priority
@@ -714,6 +774,7 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
 
                 if (completed.success) {
                     totalApplied += completed.result.applied;
+                    recordCacheStats(completed.result);
                     if (completed.result.failed && completed.result.failed.length > 0) {
                         failedItems.push(...completed.result.failed);
                     }
@@ -867,6 +928,7 @@ async function translatePendingNodes() {
 
     try {
         const result = await translateBatch(textItems, currentTargetLanguage);
+        recordCacheStats(result);
         showStatus(`Translated ${result.applied} new elements`);
         setTimeout(hideStatus, 2000);
     } catch (e) {
