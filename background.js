@@ -708,7 +708,7 @@ async function translate(textItems, targetLanguage, settings) {
     const promptSig = hashString([
         format, wantJson ? 'json' : 'plain', String(settings.temperature),
         systemTemplate, userTemplate
-    ].join(' '));
+    ].join('\u0000'));
     const keyFor = cacheEnabled
         ? (text) => cacheKey(modelId, sourceLangCode, targetLanguage, promptSig, text)
         : (text) => text;
