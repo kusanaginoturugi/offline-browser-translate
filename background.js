@@ -611,6 +611,21 @@ async function translatePlainItem(provider, settings, modelId, text, vars) {
     return cleanTranslationText((raw || '').trim());
 }
 
+// Small fast non-cryptographic string hash (cyrb53). Folds the prompt shape
+// (templates + sampling params) into a compact token for the cache key without
+// bloating it with the full template text.
+function hashString(str) {
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < str.length; i++) {
+        const ch = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36);
+}
+
 async function translate(textItems, targetLanguage, settings) {
     const modelId = settings.selectedModel;
     if (!modelId) throw new Error('No model selected');
@@ -681,55 +696,60 @@ async function translate(textItems, targetLanguage, settings) {
     const results = new Map();          // originalId -> final translated text
 
     // ---- Cache + de-duplication --------------------------------------------
-    // Collapse duplicate source strings (very common on forums) so each unique
-    // text is translated at most once, and serve any text already cached from a
-    // previous batch/page/session without hitting the model. The cache key uses
-    // exactly the inputs that determine the prompt, so a hit is equivalent to a
-    // fresh translation. cache* helpers come from cache.js.
-    const cacheEnabled = settings.cacheEnabled !== false && typeof cacheGetMany === 'function';
-    const keyFor = (text) => cacheKey(modelId, sourceLangCode, targetLanguage, format, text);
+    // Group items by a key capturing everything that determines the model output
+    // (model, languages, prompt shape/params) plus the source text, so each unique
+    // string is translated once and identical strings reuse the result across
+    // batches, pages, and sessions. promptSig folds in the resolved prompt
+    // templates + structured-output mode + temperature so changing any of them
+    // doesn't serve stale output. When the cache is off/unavailable we key by raw
+    // text, which still de-dups within the request. cacheKey/cache* come from cache.js.
+    const cacheEnabled = settings.cacheEnabled !== false
+        && typeof cacheGetMany === 'function' && typeof cacheKey === 'function';
+    const promptSig = hashString([
+        format, wantJson ? 'json' : 'plain', String(settings.temperature),
+        systemTemplate, userTemplate
+    ].join(' '));
+    const keyFor = cacheEnabled
+        ? (text) => cacheKey(modelId, sourceLangCode, targetLanguage, promptSig, text)
+        : (text) => text;
 
-    // One representative id per unique source text; remember every id sharing it.
-    const repIdForKey = new Map();      // key -> representative originalId
-    const idsForRep = new Map();        // representative originalId -> [all ids]
-    const uniqueItems0 = [];            // one item per unique text, first-seen order
+    // key -> { key, item: representative, ids: [every originalId sharing this text] }
+    const groups = new Map();
     for (const item of textItems) {
         const k = keyFor(item.text);
-        if (repIdForKey.has(k)) {
-            idsForRep.get(repIdForKey.get(k)).push(item.id);
-        } else {
-            repIdForKey.set(k, item.id);
-            idsForRep.set(item.id, [item.id]);
-            uniqueItems0.push(item);
-        }
+        const g = groups.get(k);
+        if (g) g.ids.push(item.id);
+        else groups.set(k, { key: k, item, ids: [item.id] });
     }
 
-    // Serve cache hits up front; only unresolved uniques go to the model.
-    let uniqueItems = uniqueItems0;
+    // Serve cache hits up front; only unresolved groups go to the model.
     let cacheHitCount = 0;      // unique source strings served from cache
     let fromCacheItems = 0;     // text elements served from cache (incl. duplicates)
+    let missGroups;
     if (cacheEnabled) {
         try {
-            const found = await cacheGetMany(uniqueItems0.map(it => keyFor(it.text)));
-            const misses = [];
-            for (const it of uniqueItems0) {
-                const cached = found.get(keyFor(it.text));
+            const found = await cacheGetMany([...groups.keys()]);
+            missGroups = [];
+            for (const g of groups.values()) {
+                const cached = found.get(g.key);
                 if (cached !== undefined) {
-                    results.set(it.id, cached);
+                    results.set(g.item.id, cached);
                     cacheHitCount++;
-                    fromCacheItems += idsForRep.get(it.id).length;
+                    fromCacheItems += g.ids.length;
                 } else {
-                    misses.push(it);
+                    missGroups.push(g);
                 }
             }
-            uniqueItems = misses;
         } catch (e) {
             debugWarn('[Background] cache read failed, translating all:', e && e.message);
+            missGroups = [...groups.values()];
         }
+    } else {
+        missGroups = [...groups.values()];
     }
-    debugLog(`[Background] cache: ${cacheHitCount} hit / ${uniqueItems.length} miss (${repIdForKey.size} unique of ${textItems.length} total)`);
+    debugLog(`[Background] cache: ${cacheHitCount} hit / ${missGroups.length} miss (${groups.size} unique of ${textItems.length} total)`);
 
-    let pending = [...uniqueItems];     // unique, uncached items still needing a translation
+    let pending = missGroups.map(g => g.item);   // representative item per unresolved group
 
     // Attempt the batched request, retrying only the items that came back
     // missing or malformed. maxOutputRetries extra attempts after the first.
@@ -768,20 +788,24 @@ async function translate(textItems, targetLanguage, settings) {
         }
     }
 
-    // Persist freshly produced translations (only the misses we just translated).
+    // Persist freshly produced translations. Awaited so an MV3 service worker
+    // isn't torn down before the IndexedDB write commits.
     if (cacheEnabled) {
         const entries = [];
-        for (const it of uniqueItems) {
-            if (results.has(it.id)) entries.push([keyFor(it.text), results.get(it.id)]);
+        for (const g of missGroups) {
+            if (results.has(g.item.id)) entries.push([g.key, results.get(g.item.id)]);
         }
-        if (entries.length) cacheSetMany(entries).catch(e => debugWarn('[Background] cache write failed:', e && e.message));
+        if (entries.length) {
+            try { await cacheSetMany(entries); }
+            catch (e) { debugWarn('[Background] cache write failed:', e && e.message); }
+        }
     }
 
-    // Fan each representative's translation out to its duplicate siblings.
-    for (const [repId, ids] of idsForRep) {
-        if (!results.has(repId)) continue;
-        const text = results.get(repId);
-        for (const id of ids) results.set(id, text);
+    // Fan each group's translation out to every member sharing its source text.
+    for (const g of groups.values()) {
+        if (!results.has(g.item.id)) continue;
+        const text = results.get(g.item.id);
+        for (const id of g.ids) results.set(id, text);
     }
 
     // Build the final array in original order. Items that never succeeded are

@@ -548,6 +548,7 @@ let cacheItemsTotal = 0;
 function resetCacheStats() {
     cacheHitsTotal = 0;
     cacheItemsTotal = 0;
+    setStatusDetail(''); // clear any leftover cache line from a prior translation
 }
 
 // Build the "served from cache" line. Hidden until there's at least one hit, so
@@ -625,6 +626,11 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
 
             debugLog(`[Translator] translateBatch response:`, response);
 
+            // sendMessage resolves undefined if the background worker was asleep
+            // or a handler returned without responding — treat as retryable.
+            if (!response) {
+                throw new Error('No response from background (worker asleep?)');
+            }
             if (response.error) {
                 throw new Error(response.error);
             }

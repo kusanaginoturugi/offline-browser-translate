@@ -32,10 +32,14 @@
                 }
             };
             req.onsuccess = () => resolve(req.result);
-            req.onerror = () => reject(req.error);
+            // Don't memoize a rejected promise — null it so a later call retries
+            // instead of disabling the cache for the rest of the worker's life.
+            req.onerror = () => { dbPromise = null; reject(req.error); };
         });
         return dbPromise;
     }
+
+    let approxCount = null;   // in-memory entry count; avoids a COUNT on every write
 
     // Composite, collision-free key (NUL-separated).
     function cacheKey(model, sourceCode, targetCode, format, text) {
@@ -69,34 +73,37 @@
             for (const [k, v] of entries) store.put({ k, v, ts });
             t.oncomplete = () => resolve();
             t.onerror = () => reject(t.error);
-        })).then(maybeTrim);
+        })).then(() => maybeTrim(entries.length));
     }
 
     // Evict oldest entries (by write time) when the store grows past MAX_ENTRIES.
-    function maybeTrim() {
-        return openDB().then(db => new Promise((resolve) => {
-            const store = db.transaction(STORE, 'readwrite').objectStore(STORE);
-            const cnt = store.count();
-            cnt.onsuccess = () => {
-                let toDelete = cnt.result - MAX_ENTRIES;
-                if (toDelete <= 0) { resolve(); return; }
-                toDelete += Math.floor(MAX_ENTRIES * 0.1); // delete a slack chunk to avoid trimming every write
+    // Tracks the count in memory so the common path doesn't COUNT the whole store
+    // on every write (only once to seed, then on the rare over-cap trim).
+    function maybeTrim(added) {
+        const seed = (approxCount !== null)
+            ? Promise.resolve(approxCount)
+            : cacheCount().then(c => (approxCount = c));
+        return seed.then(() => {
+            approxCount += (added || 0);
+            if (approxCount <= MAX_ENTRIES) return;
+            let toDelete = approxCount - MAX_ENTRIES + Math.floor(MAX_ENTRIES * 0.1); // slack
+            return openDB().then(db => new Promise((resolve) => {
+                const store = db.transaction(STORE, 'readwrite').objectStore(STORE);
                 const cur = store.index('ts').openCursor();
                 cur.onsuccess = () => {
                     const c = cur.result;
-                    if (c && toDelete > 0) { c.delete(); toDelete--; c.continue(); }
+                    if (c && toDelete > 0) { c.delete(); toDelete--; approxCount--; c.continue(); }
                     else resolve();
                 };
                 cur.onerror = () => resolve();
-            };
-            cnt.onerror = () => resolve();
-        }));
+            }));
+        });
     }
 
     function cacheClear() {
         return openDB().then(db => new Promise((resolve, reject) => {
             const r = db.transaction(STORE, 'readwrite').objectStore(STORE).clear();
-            r.onsuccess = () => resolve();
+            r.onsuccess = () => { approxCount = 0; resolve(); };
             r.onerror = () => reject(r.error);
         }));
     }
