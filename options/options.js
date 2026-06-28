@@ -24,7 +24,7 @@ const DEFAULT_SETTINGS = {
     maxOutputRetries: 2,
     plainTextFallback: true,
     showGlow: false,  // Disabled by default
-    cacheEnabled: true
+    cacheMode: 'session'
 };
 
 // Format descriptions
@@ -92,7 +92,7 @@ const elements = {
     useStructuredOutput: document.getElementById('useStructuredOutput'),
     plainTextFallback: document.getElementById('plainTextFallback'),
     showGlow: document.getElementById('showGlow'),
-    cacheEnabled: document.getElementById('cacheEnabled'),
+    cacheMode: document.getElementById('cacheMode'),
     clearCache: document.getElementById('clearCache'),
     cacheCount: document.getElementById('cacheCount'),
     debugLogging: document.getElementById('debugLogging'),
@@ -284,7 +284,7 @@ function applySettingsToUI() {
     elements.useStructuredOutput.checked = currentSettings.useStructuredOutput;
     if (elements.plainTextFallback) elements.plainTextFallback.checked = currentSettings.plainTextFallback !== false;
     elements.showGlow.checked = currentSettings.showGlow !== false;
-    if (elements.cacheEnabled) elements.cacheEnabled.checked = currentSettings.cacheEnabled !== false;
+    if (elements.cacheMode) elements.cacheMode.value = currentSettings.cacheMode || 'session';
     elements.debugLogging.checked = !!currentSettings.debug;
     elements.floatingButton.checked = !!currentSettings.floatingButton;
     elements.customSystem.value = currentSettings.customSystemPrompt || '';
@@ -368,7 +368,7 @@ async function saveCurrentSettings() {
         useStructuredOutput: elements.useStructuredOutput.checked,
         plainTextFallback: elements.plainTextFallback ? elements.plainTextFallback.checked : true,
         showGlow: elements.showGlow.checked,
-        cacheEnabled: elements.cacheEnabled ? elements.cacheEnabled.checked : true,
+        cacheMode: elements.cacheMode ? elements.cacheMode.value : 'session',
         debug: elements.debugLogging.checked,
         floatingButton: elements.floatingButton.checked,
         // Save custom prompts from the new prompt editor

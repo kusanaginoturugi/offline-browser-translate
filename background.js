@@ -35,7 +35,9 @@ const DEFAULT_SETTINGS = {
     plainTextFallback: true, // After JSON retries fail, translate the failed items one-by-one as plain text
     showGlow: false,
     numCtx: 0,          // Ollama context window size (0 = model default)
-    cacheEnabled: true, // Reuse cached translations for identical source text (across pages)
+    // Translation cache: 'persistent' (kept across browser sessions), 'session'
+    // (kept until the browser is closed, then wiped), or 'off'.
+    cacheMode: 'session',
     debug: false,       // Enable verbose logging
     floatingButton: false // Show floating translate button on text selection (requires <all_urls> permission)
 };
@@ -703,7 +705,7 @@ async function translate(textItems, targetLanguage, settings) {
     // templates + structured-output mode + temperature so changing any of them
     // doesn't serve stale output. When the cache is off/unavailable we key by raw
     // text, which still de-dups within the request. cacheKey/cache* come from cache.js.
-    const cacheEnabled = settings.cacheEnabled !== false
+    const cacheEnabled = settings.cacheMode !== 'off'
         && typeof cacheGetMany === 'function' && typeof cacheKey === 'function';
     const promptSig = hashString([
         format, wantJson ? 'json' : 'plain', String(settings.temperature),
@@ -724,7 +726,6 @@ async function translate(textItems, targetLanguage, settings) {
 
     // Serve cache hits up front; only unresolved groups go to the model.
     let cacheHitCount = 0;      // unique source strings served from cache
-    let fromCacheItems = 0;     // text elements served from cache (incl. duplicates)
     let missGroups;
     if (cacheEnabled) {
         try {
@@ -735,7 +736,6 @@ async function translate(textItems, targetLanguage, settings) {
                 if (cached !== undefined) {
                     results.set(g.item.id, cached);
                     cacheHitCount++;
-                    fromCacheItems += g.ids.length;
                 } else {
                     missGroups.push(g);
                 }
@@ -810,10 +810,9 @@ async function translate(textItems, targetLanguage, settings) {
 
     // Build the final array in original order. Items that never succeeded are
     // returned with an error so the content script keeps their original text.
-    const translations = textItems.map(item => results.has(item.id)
+    return textItems.map(item => results.has(item.id)
         ? { id: item.id, text: results.get(item.id) }
         : { id: item.id, error: 'translation failed' });
-    return { translations, fromCache: fromCacheItems, total: textItems.length };
 }
 
 // ============================================================================
@@ -898,16 +897,12 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                         };
                     }
 
-                    const result = await translate(
+                    const translations = await translate(
                         message.texts,
                         message.targetLanguage,
                         settingsWithSource
                     );
-                    sendResponse({
-                        translations: result.translations,
-                        fromCache: result.fromCache,
-                        total: result.total
-                    });
+                    sendResponse({ translations });
                     break;
 
                 case 'CLEAR_CACHE':
@@ -937,6 +932,21 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })();
 
     return true; // Keep the message channel open for async response
+});
+
+// On browser startup, wipe the translation cache if the user chose the
+// 'session' mode (keep until the browser closes). onStartup fires when the
+// profile launches but not on extension reload/update, so within-session
+// worker restarts don't lose the cache — only a real browser restart does.
+browserAPI.runtime.onStartup.addListener(async () => {
+    try {
+        const settings = await getSettings();
+        if (settings.cacheMode === 'session' && typeof cacheClear === 'function') {
+            await cacheClear();
+        }
+    } catch (e) {
+        // Best-effort; a failed clear just leaves the previous session's cache.
+    }
 });
 
 // ============================================================================

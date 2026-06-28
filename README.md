@@ -11,7 +11,7 @@ A privacy-focused browser extension that translates web pages using local LLMs (
 - 🔒 **100% Private** - All translations happen on your local machine via Ollama or LMStudio
 - 🎯 **Smart Prioritization** - Visible content and headings are translated first
 - 🌍 **Many Languages** - Supports many many languages :3
-- ⚡ **Translation Cache** - Identical text is translated once and reused across pages and sessions (great for forums); on by default, toggleable and clearable
+- ⚡ **Translation Cache** - Identical text is translated once and reused (great for forums); stored locally, with a privacy-friendly default that clears when you close the browser
 
 ## Requirements
 
@@ -64,7 +64,7 @@ This extension is designed to be privacy-focused:
 - ✅ No analytics or tracking
 - ✅ No data collection
 - ✅ Minimal permissions (only `localhost` host permissions)
-- ✅ The translation cache is stored **locally** in your browser (IndexedDB) and never leaves your machine; it can be turned off or cleared at any time
+- ✅ The translation cache is stored **locally** in your browser (IndexedDB) and never leaves your machine; by default it clears when you close the browser, and it can be set to persist, turned off, or cleared at any time
 
 ## Settings
 
@@ -78,17 +78,20 @@ Click **Advanced Settings** to configure:
 | Temperature | Model creativity (lower = more consistent) |
 | Request Format (*work in progress*) | Default JSON, Hunyuan-MT, Simple, or Custom |
 | Show Glow | Toggle visual indicator on translated text |
-| Cache translations | Reuse stored translations for identical text (on by default); includes a "Clear cache" button |
+| Cache translations | Reuse stored translations for identical text — *until browser close* (default), *across sessions*, or *off*; includes a "Clear cache" button |
 
 ## Translation Cache
 
-To avoid re-translating the same text over and over (forum boilerplate, menus, usernames, repeated phrases), translations are cached locally and reused — both later on the same page and across other pages and browser sessions.
+To avoid re-translating the same text over and over (forum boilerplate, menus, usernames, repeated phrases), translations can be cached locally and reused — both later on the same page and across other pages.
 
+- **Modes (Options → Translation Cache):**
+  - **Until I close the browser** (default) — cache speeds things up while you browse, then is wiped on the next browser start. Nothing translation-related lingers on disk between sessions.
+  - **Keep across sessions** — cache persists on disk until you clear it. Best for repeatedly visiting the same sites.
+  - **Don't cache** — every segment is translated fresh.
 - **What's cached:** the translated output for each source text segment, stored in the browser's IndexedDB (local only — nothing is uploaded).
 - **How it's keyed:** by the source text plus everything that determines the model's output — model, source & target language, request format, prompt template, structured-output mode, and temperature. Changing any of these yields fresh translations instead of stale cached ones, so the cache never serves output that wouldn't match your current settings.
-- **De-duplication:** within a single page, identical strings are translated only once and the result is reused for every occurrence.
-- **Controls:** toggle **Cache translations** in Options (on by default), or use **Clear cache** to wipe it (the button shows the current entry count). The cache is capped (oldest entries are evicted first).
-- **Live stats:** the status popup shows how many elements were served from cache and the hit rate as a page translates.
+- **De-duplication:** within a single page, identical strings are translated only once and the result is reused for every occurrence (this happens regardless of cache mode).
+- **Clearing:** use **Clear cache** to wipe it at any time (the button shows the current entry count). The cache is capped (oldest entries are evicted first).
 
 ## File Structure
 
