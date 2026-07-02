@@ -704,6 +704,7 @@ function onScroll() {
 async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAutoTranslate = true) {
     if (translationInProgress) {
         showStatus('Translation already in progress...', true);
+        setTimeout(hideStatus, 2000);
         return;
     }
 
@@ -949,6 +950,7 @@ async function translatePendingNodes() {
 async function translateSelection(targetLanguage, sourceLanguage = 'auto') {
     if (translationInProgress) {
         showStatus('Translation already in progress...', true);
+        setTimeout(hideStatus, 2000);
         return;
     }
 
