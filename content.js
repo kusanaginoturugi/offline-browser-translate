@@ -83,12 +83,14 @@ const MIN_TEXT_LENGTH = 2;
  */
 function shouldSkipElement(element) {
     if (!element || !element.tagName) return true;
-    if (SKIP_TAGS.has(element.tagName)) return true;
     if (element.isContentEditable) return true;
-    
-    // Check ancestors recursively for translate="no" or our extension elements
+
+    // Check element and ancestors for SKIP_TAGS, translate="no", or our extension elements
     let curr = element;
     while (curr) {
+        if (curr.tagName && SKIP_TAGS.has(curr.tagName)) {
+            return true;
+        }
         if (curr.getAttribute && curr.getAttribute('translate') === 'no') {
             return true;
         }
