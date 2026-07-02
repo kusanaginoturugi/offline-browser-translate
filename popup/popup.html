@@ -25,18 +25,36 @@
 
     <section class="main-controls">
       <div class="form-group">
-        <label for="modelSelect">Model</label>
-        <select id="modelSelect" disabled>
-          <option value="">Loading models...</option>
-        </select>
+        <label for="modelTrigger">Model</label>
+        <div class="lang-picker" id="modelPickerEl">
+          <button type="button" id="modelTrigger" class="lang-picker-trigger model-picker-trigger" aria-haspopup="listbox" aria-expanded="false" disabled>
+            <span id="modelTriggerLabel" class="lang-picker-label">Loading models...</span>
+            <svg class="lang-picker-caret" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </button>
+          <div id="modelMenu" class="lang-picker-menu" hidden>
+            <div class="lang-picker-search-wrap">
+              <input type="text" id="modelSearch" class="lang-picker-search" placeholder="Search models…" autocomplete="off" spellcheck="false" />
+            </div>
+            <ul id="modelList" class="lang-picker-list" role="listbox" tabindex="-1"></ul>
+          </div>
+        </div>
         <button id="refreshModels" class="icon-btn" title="Refresh models">↻</button>
       </div>
 
       <div class="form-group">
-        <label for="languageSelect">Translate to</label>
-        <select id="languageSelect">
-          <!-- Populated dynamically from languages.js -->
-        </select>
+        <label for="langTrigger">Translate to</label>
+        <div class="lang-picker" id="languagePicker">
+          <button type="button" id="langTrigger" class="lang-picker-trigger" aria-haspopup="listbox" aria-expanded="false">
+            <span id="langTriggerLabel" class="lang-picker-label">English</span>
+            <svg class="lang-picker-caret" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </button>
+          <div id="langMenu" class="lang-picker-menu" hidden>
+            <div class="lang-picker-search-wrap">
+              <input type="text" id="langSearch" class="lang-picker-search" placeholder="Search languages…" autocomplete="off" spellcheck="false" />
+            </div>
+            <ul id="langList" class="lang-picker-list" role="listbox" tabindex="-1"></ul>
+          </div>
+        </div>
       </div>
 
       <!-- Source language (only for TranslateGemma) -->
@@ -124,48 +142,20 @@
         <span id="temperatureValue">0.3</span>
       </div>
 
-      <div class="form-group">
-        <label for="requestFormat">Request Format</label>
-        <select id="requestFormat">
-          <option value="auto">Auto (detect from model)</option>
-          <option value="default">Default (JSON output)</option>
-          <option value="translategemma">TranslateGemma</option>
-          <option value="hunyuan">Hunyuan-MT</option>
-          <option value="simple">Simple (Line-by-line)</option>
-          <option value="custom">Custom</option>
-        </select>
-        <p id="formatDescription" class="format-description"></p>
-      </div>
-
       <div class="form-group checkbox-group">
         <input type="checkbox" id="showGlow" checked>
         <label for="showGlow">Show translation glow effect</label>
       </div>
 
-      <div class="form-group checkbox-group">
-        <input type="checkbox" id="useStructuredOutput" checked>
-        <label for="useStructuredOutput">Use structured JSON output</label>
-      </div>
-
-      <div class="custom-prompts" id="customPrompts" hidden>
-        <div class="form-group">
-          <label for="customSystem">System Prompt</label>
-          <div class="prompt-variables-hint">
-            <span>Insert:</span>
-            <span class="var-tag" data-insert="{{targetLanguage}}" data-target="customSystem">{{targetLanguage}}</span>
-          </div>
-          <textarea id="customSystem" rows="3" class="highlight-vars" placeholder="Custom system prompt"></textarea>
-        </div>
-
-        <div class="form-group">
-          <label for="customUser">User Prompt Template</label>
-          <div class="prompt-variables-hint">
-            <span>Insert:</span>
-            <span class="var-tag" data-insert="{{targetLanguage}}" data-target="customUser">{{targetLanguage}}</span>
-            <span class="var-tag" data-insert="{{texts}}" data-target="customUser">{{texts}}</span>
-          </div>
-          <textarea id="customUser" rows="3" class="highlight-vars" placeholder="Custom user prompt"></textarea>
-        </div>
+      <div class="form-group">
+        <label for="cacheMode">Translation cache <span class="new-badge" id="cacheNewBadge" hidden>New</span></label>
+        <select id="cacheMode">
+          <option value="off">Don't cache</option>
+          <option value="session">Until I close the browser</option>
+          <option value="persistent">Keep across sessions</option>
+        </select>
+        <p class="floating-btn-hint" id="cacheBackendWarning" hidden>⚠️ This browser doesn't support keeping the cache across sessions.</p>
+        <button id="clearCache" class="text-btn" title="Delete all cached translations">Clear cache (<span id="cacheCount">…</span>)</button>
       </div>
 
       <div class="button-row">
@@ -187,6 +177,18 @@
       </button>
       <p>All translations stay on your device</p>
     </footer>
+  </div>
+
+  <!-- Resize handle — drag to make the popup wider/taller -->
+  <div class="resize-handle" aria-hidden="true" title="Drag to resize">
+    <svg viewBox="0 0 12 12" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="2"  cy="2"  r="1.3"/>
+      <circle cx="2"  cy="6"  r="1.3"/>
+      <circle cx="2"  cy="10" r="1.3"/>
+      <circle cx="6"  cy="6"  r="1.3"/>
+      <circle cx="6"  cy="10" r="1.3"/>
+      <circle cx="10" cy="10" r="1.3"/>
+    </svg>
   </div>
 
   <script src="../languages.js"></script>

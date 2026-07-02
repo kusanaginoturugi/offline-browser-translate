@@ -168,16 +168,28 @@
                     <p class="hint">Verbose logs for troubleshooting. View in about:debugging → Inspect → Console.</p>
                 </div>
 
-                <div class="form-group checkbox-group">
-                    <input type="checkbox" id="useTranslationCache" checked>
-                    <label for="useTranslationCache">Cache translations</label>
-                    <p class="hint">Remember translated text so identical segments aren't re-translated. Cached per model and language pair.</p>
-                    <button id="clearCache" class="secondary-btn">🗑️ Clear translation cache</button>
-                    <p class="hint">Cached entries per model. Delete a model's cache to free space after trying a bad model.</p>
-                    <div id="cacheStats" class="cache-stats"></div>
-                    <button id="clearOtherModels" class="secondary-btn">🧹 Delete all except current model</button>
+            </section>
+
+            <!-- Translation Cache -->
+            <section class="settings-section">
+                <h2>💾 Translation Cache</h2>
+
+                <div class="form-group">
+                    <label for="cacheMode">Cache translations</label>
+                    <select id="cacheMode">
+                        <option value="off">Don't cache</option>
+                        <option value="session">Until I close the browser</option>
+                        <option value="persistent">Keep across sessions</option>
+                    </select>
+                    <p class="hint" id="cacheBackendWarning" hidden style="color: var(--yellow, #dbbc7f);">⚠️ This browser doesn't support keeping the cache across sessions.</p>
+                    <p class="hint">Reuse stored translations for identical text so repeated content (menus, usernames, boilerplate) isn't re-translated. Stored locally, never uploaded. <strong>Until I close the browser</strong> clears it on the next start; <strong>Keep across sessions</strong> keeps it until you clear it.</p>
                 </div>
 
+                <div class="form-group">
+                    <button id="clearCache" class="secondary-btn">🗑️ Clear cache (<span id="cacheCount">…</span> entries)</button>
+                    <button id="clearOtherModels" class="secondary-btn">🧹 Delete all except current model</button>
+                    <p class="hint">Frees space taken by models you tried and abandoned. Keeps only the currently selected model's entries.</p>
+                </div>
             </section>
 
             <!-- Advanced Features -->

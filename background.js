@@ -8,7 +8,7 @@ const browserAPI = typeof browser !== 'undefined' ? browser : chrome;
 
 // Import languages (for Service Worker context)
 if (typeof importScripts === 'function') {
-    importScripts('languages.js');
+    importScripts('languages.js', 'cache.js');
 }
 
 // ============================================================================
@@ -35,9 +35,11 @@ const DEFAULT_SETTINGS = {
     plainTextFallback: true, // After JSON retries fail, translate the failed items one-by-one as plain text
     showGlow: false,
     numCtx: 0,          // Ollama context window size (0 = model default)
+    // Translation cache: 'persistent' (kept across browser sessions), 'session'
+    // (kept until the browser is closed, then wiped), or 'off'. Off by default.
+    cacheMode: 'off',
     debug: false,       // Enable verbose logging
     floatingButton: false, // Show floating translate button on text selection (requires <all_urls> permission)
-    useTranslationCache: true, // Remember translated segments and skip re-translating identical text
     useGlossary: true   // Inject matching glossary terms into the prompt for consistent proper-noun translation
 };
 
@@ -110,142 +112,6 @@ async function getSettings() {
         return loadSettings();
     }
     return cachedSettings;
-}
-
-// ============================================================================
-// Translation Cache
-// Remembers translated segments so identical text is not re-translated.
-// Keyed by model + source + target + text. Persisted in storage.local under
-// 'translationCache' as an array of [key, value] entries. The Map's insertion
-// order doubles as a rough LRU: lookups/writes re-insert the entry, and the
-// oldest entries are trimmed once the cap is exceeded.
-// ============================================================================
-
-const TRANSLATION_CACHE_KEY = 'translationCache';
-const TRANSLATION_CACHE_MAX = 5000; // max entries before oldest are trimmed
-
-let translationCache = null;        // Map<string, string>, lazily loaded
-let cacheSaveTimer = null;
-
-async function loadTranslationCache() {
-    if (translationCache) return translationCache;
-    try {
-        const result = await browserAPI.storage.local.get(TRANSLATION_CACHE_KEY);
-        const entries = result[TRANSLATION_CACHE_KEY];
-        translationCache = new Map(Array.isArray(entries) ? entries : []);
-    } catch (e) {
-        console.error('Failed to load translation cache:', e);
-        translationCache = new Map();
-    }
-    return translationCache;
-}
-
-function makeCacheKey(modelId, sourceLang, targetLang, text) {
-    return `${modelId}\0${sourceLang}\0${targetLang}\0${text}`;
-}
-
-function cacheGet(cache, key) {
-    if (!cache.has(key)) return undefined;
-    const value = cache.get(key);
-    cache.delete(key);   // re-insert to mark as most-recently-used
-    cache.set(key, value);
-    return value;
-}
-
-function cacheSet(cache, key, value) {
-    cache.delete(key);
-    cache.set(key, value);
-}
-
-// Debounced persist. A short delay batches the many writes a full-page
-// translation produces into a single storage write.
-function scheduleCacheSave() {
-    if (cacheSaveTimer) return;
-    cacheSaveTimer = setTimeout(async () => {
-        cacheSaveTimer = null;
-        if (!translationCache) return;
-        while (translationCache.size > TRANSLATION_CACHE_MAX) {
-            translationCache.delete(translationCache.keys().next().value);
-        }
-        try {
-            await browserAPI.storage.local.set({
-                [TRANSLATION_CACHE_KEY]: [...translationCache.entries()]
-            });
-        } catch (e) {
-            console.error('Failed to save translation cache:', e);
-        }
-    }, 800);
-}
-
-async function clearTranslationCache() {
-    translationCache = new Map();
-    if (cacheSaveTimer) { clearTimeout(cacheSaveTimer); cacheSaveTimer = null; }
-    try {
-        await browserAPI.storage.local.remove(TRANSLATION_CACHE_KEY);
-    } catch (e) {
-        console.error('Failed to clear translation cache:', e);
-    }
-}
-
-// Group cached entries by model. The cache key is
-// `${modelId}\0${sourceLang}\0${targetLang}\0${text}`, so the model is the first
-// null-delimited token.
-async function cacheStatsByModel() {
-    const cache = await loadTranslationCache();
-    const counts = new Map();
-    for (const key of cache.keys()) {
-        const sp = key.indexOf('\0');
-        const model = sp === -1 ? key : key.slice(0, sp);
-        counts.set(model, (counts.get(model) || 0) + 1);
-    }
-    return [...counts.entries()]
-        .map(([model, count]) => ({ model, count }))
-        .sort((a, b) => b.count - a.count);
-}
-
-// Remove cached translations matching a model filter. `keep` true removes every
-// entry EXCEPT the given model (used to wipe experimental models, keeping the one
-// in use); `keep` false removes only that model's entries.
-async function clearModelCache(model, keep = false) {
-    if (!model) return 0;
-    const cache = await loadTranslationCache();
-    const prefix = `${model}\0`;
-    let removed = 0;
-    for (const key of [...cache.keys()]) {
-        const matches = key.startsWith(prefix);
-        if (keep ? !matches : matches) { cache.delete(key); removed++; }
-    }
-    if (removed) {
-        try {
-            await browserAPI.storage.local.set({
-                [TRANSLATION_CACHE_KEY]: [...cache.entries()]
-            });
-        } catch (e) {
-            console.error('Failed to save translation cache:', e);
-        }
-    }
-    return removed;
-}
-
-async function clearCacheEntries(modelId, sourceLang, targetLang, texts) {
-    if (!modelId || !targetLang || !Array.isArray(texts) || texts.length === 0) return 0;
-    const cache = await loadTranslationCache();
-    const source = sourceLang && sourceLang !== 'auto' ? sourceLang : 'en';
-    let removed = 0;
-    for (const text of texts) {
-        const key = makeCacheKey(modelId, source, targetLang, text);
-        if (cache.delete(key)) removed++;
-    }
-    if (removed) {
-        try {
-            await browserAPI.storage.local.set({
-                [TRANSLATION_CACHE_KEY]: [...cache.entries()]
-            });
-        } catch (e) {
-            console.error('Failed to save translation cache:', e);
-        }
-    }
-    return removed;
 }
 
 // ============================================================================
@@ -887,6 +753,41 @@ async function translatePlainItem(provider, settings, modelId, text, vars, cance
     return cleanTranslationText((raw || '').trim());
 }
 
+// Small fast non-cryptographic string hash (cyrb53). Folds the prompt shape
+// (templates + sampling params) into a compact token for the cache key without
+// bloating it with the full template text.
+function hashString(str) {
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < str.length; i++) {
+        const ch = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36);
+}
+
+// Signature of everything about the prompt shape that affects model output for
+// a given settings+model pair. Shared by translate() and the cache-entry
+// deletion handler so both derive identical cache keys.
+function promptSigFor(settings, modelId) {
+    const format = resolveRequestFormat(settings, modelId);
+    const isPlainText = PLAIN_TEXT_FORMATS.has(format);
+    const template = PROMPT_TEMPLATES[format] || PROMPT_TEMPLATES.default;
+    let systemTemplate = template.system;
+    let userTemplate = template.user;
+    if (settings.useAdvanced) {
+        if (settings.customSystemPrompt) systemTemplate = settings.customSystemPrompt;
+        if (settings.customUserPromptTemplate) userTemplate = settings.customUserPromptTemplate;
+    }
+    const wantJson = !!settings.useStructuredOutput && !isPlainText;
+    return hashString([
+        format, wantJson ? 'json' : 'plain', String(settings.temperature),
+        systemTemplate, userTemplate
+    ].join('\u0000'));
+}
+
 async function translate(textItems, targetLanguage, settings, cancelSignal) {
     const modelId = settings.selectedModel;
     if (!modelId) throw new Error('No model selected');
@@ -959,26 +860,60 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
         return good;
     };
 
-    const results = new Map();          // id -> final translated text
-    let pending = [...textItems];       // items still needing a good translation
+    const results = new Map();          // originalId -> final translated text
 
-    // Translation cache: serve identical text from storage and only send the
-    // rest to the model. fromLLM tracks which items were actual misses so we
-    // know what to write back after translating.
-    const useCache = settings.useTranslationCache !== false;
-    const cache = useCache ? await loadTranslationCache() : null;
-    const keyFor = (text) => makeCacheKey(modelId, sourceLangCode, targetLanguage, text);
-    let fromLLM = null;
-    if (cache) {
-        pending = [];
-        for (const item of textItems) {
-            const hit = cacheGet(cache, keyFor(item.text));
-            if (hit !== undefined) results.set(item.id, hit);
-            else pending.push(item);
-        }
-        fromLLM = new Set(pending.map(i => i.id));
-        debugLog(`[Background] cache: ${textItems.length - pending.length}/${textItems.length} hit, ${pending.length} to translate`);
+    // ---- Cache + de-duplication --------------------------------------------
+    // Group items by a key capturing everything that determines the model output
+    // (model, languages, prompt shape/params) plus the source text, so each unique
+    // string is translated once and identical strings reuse the result across
+    // batches, pages, and sessions. promptSig folds in the resolved prompt
+    // templates + structured-output mode + temperature so changing any of them
+    // doesn't serve stale output. When the cache is off/unavailable we key by raw
+    // text, which still de-dups within the request. cacheKey/cache* come from cache.js.
+    const cacheEnabled = settings.cacheMode !== 'off'
+        && typeof cacheGetMany === 'function' && typeof cacheKey === 'function';
+    const promptSig = promptSigFor(settings, modelId);
+    const keyFor = cacheEnabled
+        ? (text) => cacheKey(modelId, sourceLangCode, targetLanguage, promptSig, text)
+        : (text) => text;
+
+    // key -> { key, item: representative, ids: [every originalId sharing this text] }
+    const groups = new Map();
+    for (const item of textItems) {
+        const k = keyFor(item.text);
+        const g = groups.get(k);
+        if (g) g.ids.push(item.id);
+        else groups.set(k, { key: k, item, ids: [item.id] });
     }
+
+    // Serve cache hits up front; only unresolved groups go to the model.
+    let cacheHitCount = 0;      // unique source strings served from cache
+    let fromCacheItems = 0;     // text elements served from cache (incl. duplicates)
+    let missGroups;
+    if (cacheEnabled) {
+        try {
+            const found = await cacheGetMany([...groups.keys()]);
+            missGroups = [];
+            for (const g of groups.values()) {
+                const cached = found.get(g.key);
+                if (cached !== undefined) {
+                    results.set(g.item.id, cached);
+                    cacheHitCount++;
+                    fromCacheItems += g.ids.length;
+                } else {
+                    missGroups.push(g);
+                }
+            }
+        } catch (e) {
+            debugWarn('[Background] cache read failed, translating all:', e && e.message);
+            missGroups = [...groups.values()];
+        }
+    } else {
+        missGroups = [...groups.values()];
+    }
+    debugLog(`[Background] cache: ${cacheHitCount} hit / ${missGroups.length} miss (${groups.size} unique of ${textItems.length} total)`);
+
+    let pending = missGroups.map(g => g.item);   // representative item per unresolved group
 
     // Attempt the batched request, retrying only the items that came back
     // missing or malformed. maxOutputRetries extra attempts after the first.
@@ -1015,26 +950,34 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
                 debugWarn(`[Background] plain-text fallback failed for id ${item.id}:`, e.message);
             }
         }
-        pending = textItems.filter(item => !results.has(item.id));
     }
 
-    // Store freshly translated (cache-miss) items back into the cache.
-    if (cache && fromLLM) {
-        let added = false;
-        for (const item of textItems) {
-            if (fromLLM.has(item.id) && results.has(item.id)) {
-                cacheSet(cache, keyFor(item.text), results.get(item.id));
-                added = true;
-            }
+    // Persist freshly produced translations. Awaited so an MV3 service worker
+    // isn't torn down before the IndexedDB write commits.
+    if (cacheEnabled) {
+        const entries = [];
+        for (const g of missGroups) {
+            if (results.has(g.item.id)) entries.push([g.key, results.get(g.item.id)]);
         }
-        if (added) scheduleCacheSave();
+        if (entries.length) {
+            try { await cacheSetMany(entries); }
+            catch (e) { debugWarn('[Background] cache write failed:', e && e.message); }
+        }
+    }
+
+    // Fan each group's translation out to every member sharing its source text.
+    for (const g of groups.values()) {
+        if (!results.has(g.item.id)) continue;
+        const text = results.get(g.item.id);
+        for (const id of g.ids) results.set(id, text);
     }
 
     // Build the final array in original order. Items that never succeeded are
     // returned with an error so the content script keeps their original text.
-    return textItems.map(item => results.has(item.id)
+    const translations = textItems.map(item => results.has(item.id)
         ? { id: item.id, text: results.get(item.id) }
         : { id: item.id, error: 'translation failed' });
+    return { translations, fromCache: fromCacheItems, total: textItems.length, cacheActive: cacheEnabled };
 }
 
 // ============================================================================
@@ -1095,40 +1038,42 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     sendResponse({ ok: true });
                     break;
 
-                case 'CLEAR_TRANSLATION_CACHE':
-                    await clearTranslationCache();
-                    sendResponse({ ok: true });
-                    break;
-
-                case 'GET_CACHE_STATS':
-                    sendResponse({ stats: await cacheStatsByModel() });
-                    break;
-
-                case 'CLEAR_MODEL_CACHE': {
-                    const removed = await clearModelCache(message.model);
-                    sendResponse({ ok: true, removed });
-                    break;
-                }
-
                 case 'CLEAR_OTHER_MODELS_CACHE': {
                     const keepModel = settings.selectedModel;
                     if (!keepModel) {
                         sendResponse({ ok: false, error: 'No current model selected' });
                         break;
                     }
-                    const removed = await clearModelCache(keepModel, true);
-                    sendResponse({ ok: true, removed, kept: keepModel });
+                    try {
+                        const removed = await cacheDeleteModel(keepModel, true);
+                        sendResponse({ ok: true, removed, kept: keepModel });
+                    } catch (e) {
+                        sendResponse({ ok: false, error: e && e.message });
+                    }
                     break;
                 }
 
                 case 'CLEAR_TRANSLATION_CACHE_ENTRIES': {
-                    const removed = await clearCacheEntries(
-                        settings.selectedModel,
-                        message.sourceLanguage || settings.sourceLanguage,
-                        message.targetLanguage || settings.targetLanguage,
-                        message.texts
-                    );
-                    sendResponse({ ok: true, removed });
+                    // Drop the cached translations for specific source texts (used when
+                    // the user discards/retranslates a selection). Keys are rebuilt the
+                    // same way translate() builds them, promptSig included.
+                    const modelId = settings.selectedModel;
+                    const targetLang = message.targetLanguage || settings.targetLanguage;
+                    const texts = Array.isArray(message.texts) ? message.texts : [];
+                    if (!modelId || !targetLang || texts.length === 0) {
+                        sendResponse({ ok: true, removed: 0 });
+                        break;
+                    }
+                    const srcRaw = message.sourceLanguage || settings.sourceLanguage;
+                    const source = srcRaw && srcRaw !== 'auto' ? srcRaw : 'en';
+                    const sig = promptSigFor(settings, modelId);
+                    const keys = texts.map(t => cacheKey(modelId, source, targetLang, sig, t));
+                    try {
+                        const removed = await cacheDeleteKeys(keys);
+                        sendResponse({ ok: true, removed });
+                    } catch (e) {
+                        sendResponse({ ok: false, error: e && e.message });
+                    }
                     break;
                 }
 
@@ -1138,7 +1083,7 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     await browserAPI.storage.local.set({ [GLOSSARY_KEY]: entries });
                     invalidateGlossary();
                     // Glossary changes the output for the same source text — drop stale cache.
-                    await clearTranslationCache();
+                    await cacheClear();
                     sendResponse({ ok: true, count: entries.length });
                     break;
                 }
@@ -1152,7 +1097,7 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 case 'CLEAR_GLOSSARY':
                     await browserAPI.storage.local.remove(GLOSSARY_KEY);
                     invalidateGlossary();
-                    await clearTranslationCache();
+                    await cacheClear();
                     sendResponse({ ok: true });
                     break;
 
@@ -1195,13 +1140,18 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     }
 
                     try {
-                        const translations = await translate(
+                        const result = await translate(
                             message.texts,
                             message.targetLanguage,
                             settingsWithSource,
                             entry?.controller.signal
                         );
-                        sendResponse({ translations });
+                        sendResponse({
+                            translations: result.translations,
+                            fromCache: result.fromCache,
+                            total: result.total,
+                            cacheActive: result.cacheActive
+                        });
                     } finally {
                         if (entry) {
                             entry.refs--;
@@ -1212,6 +1162,31 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     }
                     break;
                 }
+
+                case 'CLEAR_CACHE':
+                    try {
+                        await cacheClear();
+                        sendResponse({ ok: true });
+                    } catch (e) {
+                        sendResponse({ ok: false, error: e && e.message });
+                    }
+                    break;
+
+                case 'CACHE_COUNT':
+                    try {
+                        sendResponse({ count: await cacheCount() });
+                    } catch (e) {
+                        sendResponse({ count: 0, error: e && e.message });
+                    }
+                    break;
+
+                case 'CACHE_BACKEND':
+                    try {
+                        sendResponse({ persistent: await cachePersistentAvailable() });
+                    } catch (e) {
+                        sendResponse({ persistent: false, error: e && e.message });
+                    }
+                    break;
 
                 case 'CANCEL_TRANSLATION': {
                     // Page is navigating away / unloading — abort this tab's
@@ -1238,6 +1213,21 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })();
 
     return true; // Keep the message channel open for async response
+});
+
+// On browser startup, wipe the translation cache if the user chose the
+// 'session' mode (keep until the browser closes). onStartup fires when the
+// profile launches but not on extension reload/update, so within-session
+// worker restarts don't lose the cache — only a real browser restart does.
+browserAPI.runtime.onStartup.addListener(async () => {
+    try {
+        const settings = await getSettings();
+        if (settings.cacheMode === 'session' && typeof cacheClear === 'function') {
+            await cacheClear();
+        }
+    } catch (e) {
+        // Best-effort; a failed clear just leaves the previous session's cache.
+    }
 });
 
 // ============================================================================

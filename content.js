@@ -677,7 +677,10 @@ function hideStatus() {
  * Detect page source language from HTML lang attribute
  * Returns base language code (e.g., "en" from "en-US")
  */
-function getPageLanguage() {
+// Returns the page's explicitly declared language code, or null when the page
+// declares none. Kept separate from getPageLanguage() so callers that need to
+// reason about "unknown" (e.g. the floating button) aren't fooled by a default.
+function getDeclaredPageLanguage() {
     const htmlLang = document.documentElement.lang || document.querySelector('html')?.getAttribute('lang');
     if (htmlLang) {
         // Extract base language code (e.g., "en" from "en-US")
@@ -688,7 +691,11 @@ function getPageLanguage() {
     if (metaLang) {
         return metaLang.split('-')[0].toLowerCase();
     }
-    return 'en'; // Default fallback
+    return null; // No declared language
+}
+
+function getPageLanguage() {
+    return getDeclaredPageLanguage() || 'en'; // Default fallback for translation source
 }
 
 /**
@@ -720,6 +727,11 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
 
             debugLog(`[Translator] translateBatch response:`, response);
 
+            // sendMessage resolves undefined if the background worker was asleep
+            // or a handler returned without responding — treat as retryable.
+            if (!response) {
+                throw new Error('No response from background (worker asleep?)');
+            }
             if (response.error) {
                 throw new Error(response.error);
             }
@@ -761,7 +773,12 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
                 console.warn(`[Translator] ${failed.length} items failed in this batch`);
             }
 
-            return { applied, failed };
+            return {
+                applied, failed,
+                fromCache: response.fromCache || 0,
+                total: (typeof response.total === 'number') ? response.total : textItems.length,
+                cacheActive: !!response.cacheActive
+            };
 
         } catch (e) {
             lastError = e;
@@ -777,7 +794,7 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
 
     // All retries failed - return all items as failed
     console.error(`[Translator] All retries failed for batch of ${textItems.length} items. Last error: ${lastError?.message}`);
-    return { applied: 0, failed: textItems };
+    return { applied: 0, failed: textItems, fromCache: 0, total: textItems.length, cacheActive: false };
 }
 
 
@@ -830,6 +847,8 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
 
         let totalApplied = 0;
         let totalProcessed = 0; // Track how many items we've attempted
+        let totalFromCache = 0; // Elements served from the translation cache
+        let cacheActive = false; // Whether the cache was on for this run
         const totalItems = textItems.length;
         const batchSize = 8; // Process in batches
         const failedItems = []; // Track items that failed for potential retry
@@ -864,6 +883,8 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
 
                 if (completed.success) {
                     totalApplied += completed.result.applied;
+                    totalFromCache += completed.result.fromCache || 0;
+                    if (completed.result.cacheActive) cacheActive = true;
                     if (completed.result.failed && completed.result.failed.length > 0) {
                         failedItems.push(...completed.result.failed);
                     }
@@ -890,6 +911,12 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
                 console.warn(`[Translator] ${failedItems.length} items failed:`,
                     failedItems.slice(0, 5).map(f => f.text.substring(0, 30)));
                 statusMsg += ` - ${failedItems.length} failed`;
+            }
+
+            // If the cache was active and served some entries, tell the user
+            if (cacheActive && totalFromCache > 0 && totalItems > 0) {
+                const cachePercent = Math.round((totalFromCache / totalItems) * 100);
+                statusMsg += ` - ${cachePercent}% from cache`;
             }
 
             // Mark that we have cached translations for toggle
@@ -922,6 +949,11 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
         translationCancelled = false;
         pendingTranslationQueue = [];
         window.removeEventListener('scroll', onScroll);
+        // Let the popup know translation is done so it can reset its button
+        // (e.g. when everything was served from cache and finished instantly).
+        try {
+            browserAPI.runtime.sendMessage({ type: 'TRANSLATION_COMPLETE' }).catch(() => {});
+        } catch (e) { /* popup may be closed */ }
     }
 }
 
@@ -1346,7 +1378,10 @@ function tryShowFloatingBtn() {
     if (!floatingButtonEnabled) return;
     const selection = window.getSelection();
     const selectedText = selection?.toString().trim() || '';
-    const sameLanguage = getPageLanguage() === currentTargetLanguage;
+    // Only suppress when the page *explicitly* declares the target language; an
+    // undeclared page (null) is treated as unknown so the button still appears.
+    const declaredLang = getDeclaredPageLanguage();
+    const sameLanguage = declaredLang !== null && declaredLang === currentTargetLanguage;
     if (selection && !selection.isCollapsed && selectedText.length >= MIN_TEXT_LENGTH
             && !sameLanguage && !translationInProgress && !suppressFloatingBtn) {
         showFloatingBtn(selection);

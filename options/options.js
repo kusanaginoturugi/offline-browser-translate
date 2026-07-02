@@ -24,7 +24,8 @@ const DEFAULT_SETTINGS = {
     maxOutputRetries: 2,
     plainTextFallback: true,
     showGlow: false,  // Disabled by default
-    useGlossary: true
+    useGlossary: true,
+    cacheMode: 'off'
 };
 
 // Format descriptions
@@ -92,10 +93,11 @@ const elements = {
     useStructuredOutput: document.getElementById('useStructuredOutput'),
     plainTextFallback: document.getElementById('plainTextFallback'),
     showGlow: document.getElementById('showGlow'),
-    debugLogging: document.getElementById('debugLogging'),
-    useTranslationCache: document.getElementById('useTranslationCache'),
+    cacheMode: document.getElementById('cacheMode'),
+    cacheBackendWarning: document.getElementById('cacheBackendWarning'),
     clearCache: document.getElementById('clearCache'),
-    cacheStats: document.getElementById('cacheStats'),
+    cacheCount: document.getElementById('cacheCount'),
+    debugLogging: document.getElementById('debugLogging'),
     clearOtherModels: document.getElementById('clearOtherModels'),
     useGlossary: document.getElementById('useGlossary'),
     glossaryFile: document.getElementById('glossaryFile'),
@@ -179,7 +181,45 @@ async function init() {
     await loadModels();
     setupEventListeners();
     refreshGlossaryStatus();
-    refreshCacheStats();
+    refreshCacheCount();
+    refreshCacheBackend();
+
+    // The options page opens in a persistent tab, so init() only runs once. Refresh
+    // the cached-entry count whenever the tab is re-focused (e.g. after translating
+    // a page in another tab) so it doesn't show a stale value.
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) refreshCacheCount();
+    });
+}
+
+// Grey out "Keep across sessions" when the browser blocks IndexedDB (e.g. hardened
+// Firefox forks like Mullvad/Tor), since persistence can't work there.
+async function refreshCacheBackend() {
+    if (!elements.cacheMode) return;
+    let persistent = true;
+    try {
+        const res = await browserAPI.runtime.sendMessage({ type: 'CACHE_BACKEND' });
+        persistent = !(res && res.persistent === false);
+    } catch (e) { /* assume available on error */ }
+
+    const opt = elements.cacheMode.querySelector('option[value="persistent"]');
+    if (opt) opt.disabled = !persistent;
+    if (elements.cacheBackendWarning) elements.cacheBackendWarning.hidden = persistent;
+    // If persistence isn't available but it was the saved choice, fall back to session.
+    if (!persistent && elements.cacheMode.value === 'persistent') {
+        elements.cacheMode.value = 'session';
+    }
+}
+
+// Show how many translations are currently cached.
+async function refreshCacheCount() {
+    if (!elements.cacheCount) return;
+    try {
+        const res = await browserAPI.runtime.sendMessage({ type: 'CACHE_COUNT' });
+        elements.cacheCount.textContent = (res && typeof res.count === 'number') ? res.count.toLocaleString() : '0';
+    } catch (e) {
+        elements.cacheCount.textContent = '0';
+    }
 }
 
 // Load available models from providers
@@ -279,8 +319,8 @@ function applySettingsToUI() {
     elements.useStructuredOutput.checked = currentSettings.useStructuredOutput;
     if (elements.plainTextFallback) elements.plainTextFallback.checked = currentSettings.plainTextFallback !== false;
     elements.showGlow.checked = currentSettings.showGlow !== false;
+    if (elements.cacheMode) elements.cacheMode.value = currentSettings.cacheMode || 'off';
     elements.debugLogging.checked = !!currentSettings.debug;
-    if (elements.useTranslationCache) elements.useTranslationCache.checked = currentSettings.useTranslationCache !== false;
     if (elements.useGlossary) elements.useGlossary.checked = currentSettings.useGlossary !== false;
     elements.floatingButton.checked = !!currentSettings.floatingButton;
     elements.customSystem.value = currentSettings.customSystemPrompt || '';
@@ -364,8 +404,8 @@ async function saveCurrentSettings() {
         useStructuredOutput: elements.useStructuredOutput.checked,
         plainTextFallback: elements.plainTextFallback ? elements.plainTextFallback.checked : true,
         showGlow: elements.showGlow.checked,
+        cacheMode: elements.cacheMode ? elements.cacheMode.value : 'off',
         debug: elements.debugLogging.checked,
-        useTranslationCache: elements.useTranslationCache ? elements.useTranslationCache.checked : true,
         useGlossary: elements.useGlossary ? elements.useGlossary.checked : true,
         floatingButton: elements.floatingButton.checked,
         // Save custom prompts from the new prompt editor
@@ -408,51 +448,6 @@ async function refreshGlossaryStatus() {
             : 'No glossary loaded.';
     } catch (e) {
         elements.glossaryStatus.textContent = 'No glossary loaded.';
-    }
-}
-
-// Show per-model cache counts with a delete button for each model.
-async function refreshCacheStats() {
-    if (!elements.cacheStats) return;
-    let stats = [];
-    try {
-        const res = await browserAPI.runtime.sendMessage({ type: 'GET_CACHE_STATS' });
-        stats = (res && res.stats) || [];
-    } catch (e) { /* leave empty */ }
-
-    elements.cacheStats.innerHTML = '';
-    if (!stats.length) {
-        elements.cacheStats.textContent = 'Cache is empty.';
-        return;
-    }
-
-    const current = currentSettings.selectedModel || '';
-    for (const { model, count } of stats) {
-        const row = document.createElement('div');
-        row.className = 'cache-stat-row';
-
-        const label = document.createElement('span');
-        label.className = 'cache-stat-label';
-        const isCurrent = model === current;
-        label.textContent = `${model} — ${count} ${count === 1 ? 'entry' : 'entries'}${isCurrent ? ' (current)' : ''}`;
-
-        const btn = document.createElement('button');
-        btn.className = 'secondary-btn';
-        btn.textContent = '🗑️';
-        btn.title = `Delete cached translations for ${model}`;
-        btn.addEventListener('click', async () => {
-            const res = await browserAPI.runtime.sendMessage({ type: 'CLEAR_MODEL_CACHE', model });
-            if (res && res.ok) {
-                showToast(`Cleared ${res.removed} ${res.removed === 1 ? 'entry' : 'entries'} for ${model}`);
-                await refreshCacheStats();
-            } else {
-                showToast('Failed to clear cache', 'error');
-            }
-        });
-
-        row.appendChild(label);
-        row.appendChild(btn);
-        elements.cacheStats.appendChild(row);
     }
 }
 
@@ -512,8 +507,18 @@ function setupEventListeners() {
 
     // Save settings
     elements.saveSettings.addEventListener('click', async () => {
+        // Request host permission for any non-localhost server URL (opt-in).
+        // Must run inside this click gesture, before any other awaits.
+        const granted = await ensureHostPermissions([
+            elements.ollamaUrl.value,
+            elements.lmstudioUrl.value
+        ]);
         await saveCurrentSettings();
-        showToast('Settings saved!');
+        if (!granted) {
+            showToast('Saved, but permission for the custom server was denied — remote models won\'t load until you allow it.', 'error', 5000);
+        } else {
+            showToast('Settings saved!');
+        }
     });
 
     // Reset settings
@@ -531,11 +536,11 @@ function setupEventListeners() {
     // Clear translation cache
     if (elements.clearCache) {
         elements.clearCache.addEventListener('click', async () => {
-            const res = await browserAPI.runtime.sendMessage({ type: 'CLEAR_TRANSLATION_CACHE' });
-            if (res && res.ok) {
+            try {
+                await browserAPI.runtime.sendMessage({ type: 'CLEAR_CACHE' });
+                await refreshCacheCount();
                 showToast('Translation cache cleared');
-                await refreshCacheStats();
-            } else {
+            } catch (e) {
                 showToast('Failed to clear cache', 'error');
             }
         });
@@ -547,7 +552,7 @@ function setupEventListeners() {
             const res = await browserAPI.runtime.sendMessage({ type: 'CLEAR_OTHER_MODELS_CACHE' });
             if (res && res.ok) {
                 showToast(`Cleared ${res.removed} ${res.removed === 1 ? 'entry' : 'entries'}, kept ${res.kept}`);
-                await refreshCacheStats();
+                await refreshCacheCount();
             } else {
                 showToast(res && res.error ? res.error : 'Failed to clear cache', 'error');
             }

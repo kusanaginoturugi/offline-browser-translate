@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local LLM Translator",
-  "version": "1.5.9",
+  "version": "1.6.0",
   "description": "Privacy-focused translation using local LLMs (Ollama, LMStudio). Your data never leaves your machine.",
   "permissions": [
     "activeTab",
@@ -29,6 +29,7 @@
   "background": {
     "scripts": [
       "languages.js",
+      "cache.js",
       "background.js"
     ],
     "service_worker": "background.js"
