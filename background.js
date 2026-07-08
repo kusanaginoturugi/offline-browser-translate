@@ -127,10 +127,13 @@ async function getSettings() {
 // ============================================================================
 
 const GLOSSARY_KEY = 'glossary';
+const GLOSSARY_META_KEY = 'glossaryMeta';  // { name, loadedAt } of the loaded TSV, for the options UI
 const GLOSSARY_MAX_HITS = 40;   // cap terms injected per batch to keep prompts small
+const GLOSSARY_PREVIEW_MAX = 200; // rows sent to the options page for the preview list
 
 let glossaryEntries = null;     // Array<[source, target]>, lazily loaded
 let glossaryAutomaton = null;   // built Aho-Corasick root, or null
+let glossaryExactIndex = null;  // Map<source, target> for whole-segment lookups
 
 async function loadGlossary() {
     if (glossaryEntries) return glossaryEntries;
@@ -143,6 +146,7 @@ async function loadGlossary() {
         glossaryEntries = [];
     }
     glossaryAutomaton = null;
+    glossaryExactIndex = null;
     return glossaryEntries;
 }
 
@@ -151,6 +155,30 @@ async function loadGlossary() {
 function invalidateGlossary() {
     glossaryEntries = null;
     glossaryAutomaton = null;
+    glossaryExactIndex = null;
+}
+
+// Map of source => target for whole-segment lookups. A segment that consists
+// entirely of a glossary term (e.g. the nav heading "About") is translated
+// deterministically from this map instead of being sent to the model — prompt
+// hints only nudge the model, and short context-free labels are exactly where
+// small models produce broken output ("About" => "について"). An empty target
+// means "keep as-is", same as the prompt-hint path. Returns null when the
+// glossary is off or empty.
+async function getGlossaryExactIndex(settings) {
+    if (settings.useGlossary === false) return null;
+    const entries = await loadGlossary();
+    if (!entries.length) return null;
+    if (!glossaryExactIndex) {
+        glossaryExactIndex = new Map();
+        for (const entry of entries) {
+            const src = entry && entry[0];
+            if (!src) continue;
+            const tgt = entry[1];
+            glossaryExactIndex.set(src, (tgt === undefined || tgt === '') ? src : tgt);
+        }
+    }
+    return glossaryExactIndex;
 }
 
 function isWordChar(c) {
@@ -886,15 +914,36 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
         else groups.set(k, { key: k, item, ids: [item.id] });
     }
 
+    // Whole-segment glossary matches resolve deterministically, before the cache
+    // and the model — the user's explicit mapping beats both a cached LLM answer
+    // and a fresh one. Not written to the cache (the lookup is cheaper than it).
+    let glossaryExactCount = 0;
+    const exactIndex = await getGlossaryExactIndex(settings);
+    if (exactIndex) {
+        for (const g of groups.values()) {
+            const direct = exactIndex.get(g.item.text.trim());
+            if (direct !== undefined) {
+                results.set(g.item.id, direct);
+                glossaryExactCount++;
+            }
+        }
+        if (glossaryExactCount) {
+            debugLog(`[Background] glossary: ${glossaryExactCount} whole-segment match(es) resolved without the model`);
+        }
+    }
+    const unresolvedGroups = glossaryExactCount
+        ? [...groups.values()].filter(g => !results.has(g.item.id))
+        : [...groups.values()];
+
     // Serve cache hits up front; only unresolved groups go to the model.
     let cacheHitCount = 0;      // unique source strings served from cache
     let fromCacheItems = 0;     // text elements served from cache (incl. duplicates)
     let missGroups;
     if (cacheEnabled) {
         try {
-            const found = await cacheGetMany([...groups.keys()]);
+            const found = await cacheGetMany(unresolvedGroups.map(g => g.key));
             missGroups = [];
-            for (const g of groups.values()) {
+            for (const g of unresolvedGroups) {
                 const cached = found.get(g.key);
                 if (cached !== undefined) {
                     results.set(g.item.id, cached);
@@ -906,10 +955,10 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
             }
         } catch (e) {
             debugWarn('[Background] cache read failed, translating all:', e && e.message);
-            missGroups = [...groups.values()];
+            missGroups = unresolvedGroups;
         }
     } else {
-        missGroups = [...groups.values()];
+        missGroups = unresolvedGroups;
     }
     debugLog(`[Background] cache: ${cacheHitCount} hit / ${missGroups.length} miss (${groups.size} unique of ${textItems.length} total)`);
 
@@ -1038,21 +1087,6 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     sendResponse({ ok: true });
                     break;
 
-                case 'CLEAR_OTHER_MODELS_CACHE': {
-                    const keepModel = settings.selectedModel;
-                    if (!keepModel) {
-                        sendResponse({ ok: false, error: 'No current model selected' });
-                        break;
-                    }
-                    try {
-                        const removed = await cacheDeleteModel(keepModel, true);
-                        sendResponse({ ok: true, removed, kept: keepModel });
-                    } catch (e) {
-                        sendResponse({ ok: false, error: e && e.message });
-                    }
-                    break;
-                }
-
                 case 'CLEAR_TRANSLATION_CACHE_ENTRIES': {
                     // Drop the cached translations for specific source texts (used when
                     // the user discards/retranslates a selection). Keys are rebuilt the
@@ -1080,24 +1114,40 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 case 'SAVE_GLOSSARY': {
                     // entries: Array<[source, target]> already parsed by the options page.
                     const entries = Array.isArray(message.entries) ? message.entries : [];
-                    await browserAPI.storage.local.set({ [GLOSSARY_KEY]: entries });
+                    const meta = {
+                        name: typeof message.name === 'string' ? message.name : '',
+                        loadedAt: Date.now()
+                    };
+                    await browserAPI.storage.local.set({ [GLOSSARY_KEY]: entries, [GLOSSARY_META_KEY]: meta });
                     invalidateGlossary();
                     // Glossary changes the output for the same source text — drop stale cache.
-                    await cacheClear();
+                    if (typeof cacheClear === 'function') await cacheClear();
                     sendResponse({ ok: true, count: entries.length });
                     break;
                 }
 
                 case 'GET_GLOSSARY_INFO': {
                     const entries = await loadGlossary();
-                    sendResponse({ count: entries.length });
+                    let meta = null;
+                    try {
+                        const result = await browserAPI.storage.local.get(GLOSSARY_META_KEY);
+                        meta = result[GLOSSARY_META_KEY] || null;
+                    } catch (e) { /* meta is cosmetic — count/preview still work */ }
+                    sendResponse({
+                        count: entries.length,
+                        name: meta && meta.name || '',
+                        loadedAt: meta && meta.loadedAt || null,
+                        // First rows only: enough to eyeball the dictionary without
+                        // shipping tens of thousands of pairs to the options page.
+                        preview: entries.slice(0, GLOSSARY_PREVIEW_MAX)
+                    });
                     break;
                 }
 
                 case 'CLEAR_GLOSSARY':
-                    await browserAPI.storage.local.remove(GLOSSARY_KEY);
+                    await browserAPI.storage.local.remove([GLOSSARY_KEY, GLOSSARY_META_KEY]);
                     invalidateGlossary();
-                    await cacheClear();
+                    if (typeof cacheClear === 'function') await cacheClear();
                     sendResponse({ ok: true });
                     break;
 

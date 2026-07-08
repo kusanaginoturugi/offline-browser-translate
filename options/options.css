@@ -421,29 +421,52 @@ button {
     background: var(--bg-tertiary);
 }
 
-.cache-stats {
-    margin-top: 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
+.glossary-status-loaded {
+    color: var(--text-primary);
 }
 
-.cache-stat-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
+.glossary-preview {
+    margin: 8px 0 12px;
+}
+
+.glossary-preview summary {
     font-size: 13px;
     color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
 }
 
-.cache-stat-label {
+.glossary-preview summary:hover {
+    color: var(--text-primary);
+}
+
+.glossary-terms {
+    margin-top: 8px;
+    max-height: 240px;
+    overflow-y: auto;
+    padding: 8px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--bg-tertiary);
+    border-radius: 6px;
+    font-size: 13px;
+}
+
+.glossary-term-row {
+    padding: 2px 0;
+    color: var(--text-secondary);
     overflow-wrap: anywhere;
 }
 
-.cache-stat-row .secondary-btn {
-    flex: none;
-    padding: 2px 8px;
+.glossary-term-source {
+    color: var(--text-primary);
+}
+
+.glossary-term-target {
+    color: var(--text-primary);
+}
+
+.glossary-term-more {
+    font-style: italic;
 }
 
 .danger-btn {

@@ -98,10 +98,11 @@ const elements = {
     clearCache: document.getElementById('clearCache'),
     cacheCount: document.getElementById('cacheCount'),
     debugLogging: document.getElementById('debugLogging'),
-    clearOtherModels: document.getElementById('clearOtherModels'),
     useGlossary: document.getElementById('useGlossary'),
     glossaryFile: document.getElementById('glossaryFile'),
     glossaryStatus: document.getElementById('glossaryStatus'),
+    glossaryPreview: document.getElementById('glossaryPreview'),
+    glossaryTerms: document.getElementById('glossaryTerms'),
     clearGlossary: document.getElementById('clearGlossary'),
     floatingButton: document.getElementById('floatingButton'),
     customPromptsSection: document.getElementById('customPromptsSection'),
@@ -437,18 +438,55 @@ function parseGlossaryTSV(text) {
     return entries;
 }
 
-// Refresh the "N terms loaded" status line from the background.
+// Refresh the glossary status line (count, file name, load time) and the
+// expandable preview of loaded terms.
 async function refreshGlossaryStatus() {
     if (!elements.glossaryStatus) return;
+    let res = null;
     try {
-        const res = await browserAPI.runtime.sendMessage({ type: 'GET_GLOSSARY_INFO' });
-        const count = res && res.count ? res.count : 0;
-        elements.glossaryStatus.textContent = count
-            ? `${count} term${count === 1 ? '' : 's'} loaded.`
-            : 'No glossary loaded.';
-    } catch (e) {
+        res = await browserAPI.runtime.sendMessage({ type: 'GET_GLOSSARY_INFO' });
+    } catch (e) { /* fall through to the empty state */ }
+    const count = res && res.count ? res.count : 0;
+
+    if (!count) {
         elements.glossaryStatus.textContent = 'No glossary loaded.';
+        elements.glossaryStatus.classList.remove('glossary-status-loaded');
+        if (elements.glossaryPreview) elements.glossaryPreview.hidden = true;
+        return;
     }
+
+    let status = `✅ ${count.toLocaleString()} term${count === 1 ? '' : 's'} loaded`;
+    if (res.name) status += ` from ${res.name}`;
+    if (res.loadedAt) status += ` (${new Date(res.loadedAt).toLocaleString()})`;
+    elements.glossaryStatus.textContent = status + '.';
+    elements.glossaryStatus.classList.add('glossary-status-loaded');
+
+    // Preview list. Built with textContent so TSV content is never parsed as HTML.
+    if (!elements.glossaryPreview || !elements.glossaryTerms) return;
+    const preview = Array.isArray(res.preview) ? res.preview : [];
+    elements.glossaryTerms.replaceChildren();
+    for (const entry of preview) {
+        const src = entry && entry[0];
+        if (!src) continue;
+        const tgt = entry[1];
+        const row = document.createElement('div');
+        row.className = 'glossary-term-row';
+        const from = document.createElement('span');
+        from.className = 'glossary-term-source';
+        from.textContent = src;
+        const to = document.createElement('span');
+        to.className = 'glossary-term-target';
+        to.textContent = (tgt === undefined || tgt === '') ? '(kept as-is)' : tgt;
+        row.append(from, ' → ', to);
+        elements.glossaryTerms.appendChild(row);
+    }
+    if (count > preview.length) {
+        const more = document.createElement('div');
+        more.className = 'glossary-term-row glossary-term-more';
+        more.textContent = `… and ${(count - preview.length).toLocaleString()} more`;
+        elements.glossaryTerms.appendChild(more);
+    }
+    elements.glossaryPreview.hidden = false;
 }
 
 // Show toast notification
@@ -546,19 +584,6 @@ function setupEventListeners() {
         });
     }
 
-    // Delete every model's cache except the one currently in use
-    if (elements.clearOtherModels) {
-        elements.clearOtherModels.addEventListener('click', async () => {
-            const res = await browserAPI.runtime.sendMessage({ type: 'CLEAR_OTHER_MODELS_CACHE' });
-            if (res && res.ok) {
-                showToast(`Cleared ${res.removed} ${res.removed === 1 ? 'entry' : 'entries'}, kept ${res.kept}`);
-                await refreshCacheCount();
-            } else {
-                showToast(res && res.error ? res.error : 'Failed to clear cache', 'error');
-            }
-        });
-    }
-
     // Glossary: load from a TSV file
     if (elements.glossaryFile) {
         elements.glossaryFile.addEventListener('change', async (e) => {
@@ -571,7 +596,7 @@ function setupEventListeners() {
                     showToast('No valid entries found in file', 'error');
                     return;
                 }
-                const res = await browserAPI.runtime.sendMessage({ type: 'SAVE_GLOSSARY', entries });
+                const res = await browserAPI.runtime.sendMessage({ type: 'SAVE_GLOSSARY', entries, name: file.name });
                 if (res && res.ok) {
                     await refreshGlossaryStatus();
                     showToast(`Glossary loaded: ${res.count} terms`);

@@ -187,8 +187,6 @@
 
                 <div class="form-group">
                     <button id="clearCache" class="secondary-btn">🗑️ Clear cache (<span id="cacheCount">…</span> entries)</button>
-                    <button id="clearOtherModels" class="secondary-btn">🧹 Delete all except current model</button>
-                    <p class="hint">Frees space taken by models you tried and abandoned. Keeps only the currently selected model's entries.</p>
                 </div>
             </section>
 
@@ -219,6 +217,10 @@
                     <input type="file" id="glossaryFile" accept=".tsv,.txt,text/plain">
                     <p class="hint">One entry per line: <code>source&lt;TAB&gt;translation</code>. Omit the second column to keep a term as-is (do not translate). Lines starting with <code>#</code> and blank lines are ignored. Loading replaces the current dictionary and clears the translation cache.</p>
                     <p class="hint" id="glossaryStatus">No glossary loaded.</p>
+                    <details id="glossaryPreview" class="glossary-preview" hidden>
+                        <summary>Show loaded terms</summary>
+                        <div id="glossaryTerms" class="glossary-terms"></div>
+                    </details>
                     <button id="clearGlossary" class="secondary-btn">🗑️ Clear glossary</button>
                 </div>
             </section>

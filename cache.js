@@ -17,7 +17,7 @@
  *
  * Loaded in the background context (service worker on Chrome, event-page script
  * on Firefox). Exposes its API on the global object: cacheKey, cacheGetMany,
- * cacheSetMany, cacheClear, cacheCount, cacheDeleteKeys, cacheDeleteModel.
+ * cacheSetMany, cacheClear, cacheCount, cacheDeleteKeys.
  */
 (function () {
     const DB_NAME = 'llm-translator-cache';
@@ -159,37 +159,6 @@
         }).catch(() => memRemoved);
     }
 
-    // Delete every entry belonging to `model` — or, with keep=true, every entry
-    // that does NOT belong to it (wipe abandoned models, keep the current one).
-    // Works by key prefix: keys always start with `model<NUL>`.
-    function cacheDeleteModel(model, keep) {
-        if (!model) return Promise.resolve(0);
-        const prefix = model + SEP;
-        let memRemoved = 0;
-        for (const k of [...mem.keys()]) {
-            const matches = k.startsWith(prefix);
-            if (keep ? !matches : matches) { mem.delete(k); memRemoved++; }
-        }
-        if (idbDisabled) return Promise.resolve(memRemoved);
-        return openDB().then(db => new Promise((resolve) => {
-            const store = db.transaction(STORE, 'readwrite').objectStore(STORE);
-            let idbRemoved = 0;
-            const cur = store.openCursor();
-            cur.onsuccess = () => {
-                const c = cur.result;
-                if (!c) { resolve(idbRemoved); return; }
-                const matches = String(c.key).startsWith(prefix);
-                if (keep ? !matches : matches) { c.delete(); idbRemoved++; }
-                c.continue();
-            };
-            cur.onerror = () => resolve(idbRemoved);
-        })).then((idbRemoved) => {
-            const removed = Math.max(memRemoved, idbRemoved);
-            if (approxCount !== null) approxCount = Math.max(0, approxCount - removed);
-            return removed;
-        }).catch(() => memRemoved);
-    }
-
     function cacheClear() {
         mem.clear();
         if (idbDisabled) return Promise.resolve();
@@ -222,5 +191,5 @@
 
     const g = (typeof self !== 'undefined') ? self
         : (typeof globalThis !== 'undefined') ? globalThis : window;
-    Object.assign(g, { cacheKey, cacheGetMany, cacheSetMany, cacheClear, cacheCount, cachePersistentAvailable, cacheDeleteKeys, cacheDeleteModel });
+    Object.assign(g, { cacheKey, cacheGetMany, cacheSetMany, cacheClear, cacheCount, cachePersistentAvailable, cacheDeleteKeys });
 })();

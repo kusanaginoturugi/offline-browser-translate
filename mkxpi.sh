@@ -17,6 +17,7 @@ rm -f "$out"
 bsdtar --format zip -cf "$out" \
 	manifest.json \
 	background.js \
+	cache.js \
 	content.js \
 	languages.js \
 	options \
