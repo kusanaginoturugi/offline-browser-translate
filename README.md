@@ -73,6 +73,20 @@ disables tool calls, which breaks llama-server's built-in web UI. Passing a
 built-in template *name* while Jinja is enabled does not work — the name is
 treated as a literal template string.)
 
+### Remote servers and gateways
+
+The llama.cpp provider speaks the plain OpenAI-compatible API
+(`GET /v1/models`, `POST /v1/chat/completions`), so it also works with any
+endpoint that exposes it: `llama-server` on another machine, vLLM, or an AI
+gateway such as [Tailscale Aperture](https://tailscale.com/docs/aperture) —
+useful for translating on a machine without a GPU by borrowing one over your
+tailnet.
+
+Point the **llama.cpp URL** at the remote endpoint (e.g.
+`http://myserver.my-tailnet.ts.net`). For non-localhost URLs the extension
+asks for host permission for that origin when you hit Save — an explicit
+opt-in, since the extension ships with localhost-only permissions.
+
 ## Installation
 
 ### Firefox / Mullvad Browser
