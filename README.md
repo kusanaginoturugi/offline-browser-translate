@@ -43,14 +43,35 @@ configuration is needed.
 
 **TranslateGemma note:** the model's bundled chat template requires a special
 structured input and makes `llama-server` reject plain OpenAI-style messages
-(startup fails with a Jinja exception). Override it with the standard Gemma
-template — the extension builds the full TranslateGemma prompt itself:
+(startup fails with a Jinja exception). Override it with a plain Gemma
+template — the extension builds the full TranslateGemma prompt itself. Save
+this as `gemma.jinja`:
+
+```jinja
+{{ bos_token }}{%- for message in messages -%}
+    {%- if message['role'] == 'assistant' -%}
+        {{ '<start_of_turn>model\n' + (message['content'] | trim) + '<end_of_turn>\n' }}
+    {%- else -%}
+        {{ '<start_of_turn>user\n' + (message['content'] | trim) + '<end_of_turn>\n' }}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{ '<start_of_turn>model\n' }}
+{%- endif -%}
+```
+
+and start the server with it:
 
 ```sh
 llama-server -hf mradermacher/translategemma-4b-it-GGUF:Q4_K_M \
   --host 127.0.0.1 --port 8080 -ngl 999 \
-  --no-jinja --chat-template gemma
+  --jinja --chat-template-file gemma.jinja
 ```
+
+(`--no-jinja --chat-template gemma` also works for translation, but it
+disables tool calls, which breaks llama-server's built-in web UI. Passing a
+built-in template *name* while Jinja is enabled does not work — the name is
+treated as a literal template string.)
 
 ## Installation
 
