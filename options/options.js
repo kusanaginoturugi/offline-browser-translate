@@ -9,6 +9,7 @@ const DEFAULT_SETTINGS = {
     provider: 'auto',
     ollamaUrl: 'http://localhost:11434',
     lmstudioUrl: 'http://localhost:1234',
+    llamacppUrl: 'http://localhost:8080',
     selectedModel: '',
     targetLanguage: 'en',
     sourceLanguage: 'auto',
@@ -75,6 +76,7 @@ const elements = {
     providerSelect: document.getElementById('providerSelect'),
     ollamaUrl: document.getElementById('ollamaUrl'),
     lmstudioUrl: document.getElementById('lmstudioUrl'),
+    llamacppUrl: document.getElementById('llamacppUrl'),
     modelSelect: document.getElementById('modelSelect'),
     refreshModels: document.getElementById('refreshModels'),
     sourceLanguage: document.getElementById('sourceLanguage'),
@@ -224,13 +226,13 @@ async function refreshCacheCount() {
 }
 
 // Load available models from providers
-async function loadModels() {
+async function loadModels(forceRefresh = false) {
     if (!elements.modelSelect) return;
 
     elements.modelSelect.innerHTML = '<option value="">Loading models...</option>';
     elements.modelSelect.disabled = true;
     try {
-        const response = await browserAPI.runtime.sendMessage({ type: 'LIST_MODELS' });
+        const response = await browserAPI.runtime.sendMessage({ type: 'LIST_MODELS', forceRefresh });
         const models = response.models || [];
 
         elements.modelSelect.innerHTML = '';
@@ -303,6 +305,7 @@ function applySettingsToUI() {
     elements.providerSelect.value = currentSettings.provider;
     elements.ollamaUrl.value = currentSettings.ollamaUrl;
     elements.lmstudioUrl.value = currentSettings.lmstudioUrl;
+    if (elements.llamacppUrl) elements.llamacppUrl.value = currentSettings.llamacppUrl;
     elements.sourceLanguage.value = currentSettings.sourceLanguage || 'auto';
     elements.targetLanguage.value = currentSettings.targetLanguage;
     elements.requestFormat.value = currentSettings.requestFormat;
@@ -394,6 +397,7 @@ async function saveCurrentSettings() {
         provider: elements.providerSelect.value,
         ollamaUrl: elements.ollamaUrl.value,
         lmstudioUrl: elements.lmstudioUrl.value,
+        llamacppUrl: elements.llamacppUrl ? elements.llamacppUrl.value : currentSettings.llamacppUrl,
         selectedModel: elements.modelSelect?.value || currentSettings.selectedModel,
         sourceLanguage: elements.sourceLanguage.value,
         targetLanguage: elements.targetLanguage.value,
@@ -526,6 +530,17 @@ function setupEventListeners() {
         updateVisibility();
     });
 
+    // Provider change — persist it right away and reload the model list, so the
+    // dropdown reflects the newly selected provider without waiting for Save.
+    elements.providerSelect.addEventListener('change', async () => {
+        currentSettings.provider = elements.providerSelect.value;
+        await browserAPI.runtime.sendMessage({
+            type: 'SAVE_SETTINGS',
+            settings: { provider: currentSettings.provider }
+        });
+        await loadModels(true);
+    });
+
     // Model selection
     if (elements.modelSelect) {
         elements.modelSelect.addEventListener('change', () => {
@@ -538,7 +553,7 @@ function setupEventListeners() {
     // Refresh models
     if (elements.refreshModels) {
         elements.refreshModels.addEventListener('click', async () => {
-            await loadModels();
+            await loadModels(true); // bypass the background's 60s model cache
             showToast('Models refreshed');
         });
     }
@@ -549,7 +564,8 @@ function setupEventListeners() {
         // Must run inside this click gesture, before any other awaits.
         const granted = await ensureHostPermissions([
             elements.ollamaUrl.value,
-            elements.lmstudioUrl.value
+            elements.lmstudioUrl.value,
+            elements.llamacppUrl?.value
         ]);
         await saveCurrentSettings();
         if (!granted) {
@@ -557,6 +573,7 @@ function setupEventListeners() {
         } else {
             showToast('Settings saved!');
         }
+        await loadModels(true); // URLs/provider may have changed
     });
 
     // Reset settings

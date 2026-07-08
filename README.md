@@ -2,7 +2,7 @@
   <img src="assets/logo.png" width="48" valign="middle"> Local LLM Translator
 </h1>
 
-A privacy-focused browser extension that translates web pages using local LLMs (Ollama or LMStudio). **Your data never leaves your machine.**
+A privacy-focused browser extension that translates web pages using local LLMs (Ollama, LMStudio, or llama.cpp). **Your data never leaves your machine.**
 
 [![Get the Add-on](https://extensionworkshop.com/assets/img/documentation/publish/get-the-addon-178x60px.dad84b42.png)](https://addons.mozilla.org/en-GB/firefox/addon/local-llm-translator/)
 
@@ -21,8 +21,36 @@ You need one of these running locally:
 
 - **[Ollama](https://ollama.ai/)** (default: `http://localhost:11434`)
 - **[LMStudio](https://lmstudio.ai/)** (default: `http://localhost:1234`)
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** `llama-server` (default: `http://localhost:8080`)
 
 With a translation-capable model loaded (e.g. `TranslateGemma`, `tencent.hunyuan-mt`, `qwen3`, etc.)
+
+### llama.cpp setup
+
+`llama-server` exposes an OpenAI-compatible API, which this extension uses directly:
+
+```sh
+llama-server \
+  -m /path/to/model.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --n-gpu-layers 999
+```
+
+For GPU acceleration, use a CUDA/ROCm/Vulkan-enabled `llama.cpp` build. Recent
+`llama-server` builds allow cross-origin requests by default, so no extra CORS
+configuration is needed.
+
+**TranslateGemma note:** the model's bundled chat template requires a special
+structured input and makes `llama-server` reject plain OpenAI-style messages
+(startup fails with a Jinja exception). Override it with the standard Gemma
+template — the extension builds the full TranslateGemma prompt itself:
+
+```sh
+llama-server -hf mradermacher/translategemma-4b-it-GGUF:Q4_K_M \
+  --host 127.0.0.1 --port 8080 -ngl 999 \
+  --no-jinja --chat-template gemma
+```
 
 ## Installation
 
@@ -88,6 +116,7 @@ browser DOM replacement time.
 
 ```sh
 PROVIDER=ollama MODEL=translategemma:4b TARGET_LANGUAGE=Japanese ./scripts/benchmark.rb
+PROVIDER=llamacpp TARGET_LANGUAGE=Japanese ./scripts/benchmark.rb
 ```
 
 Recommended reporting:
@@ -99,22 +128,26 @@ Recommended reporting:
 
 ### Local Reference
 
-Measured on 2026-06-24 with Ollama, English -> Japanese, 8 segments / 584 source
-characters. These are reference numbers for this machine, not a guarantee for
-other pages; real page translation also depends on DOM size, cache hits, and
-parallel request settings.
+Measured on 2026-07-08, English -> Japanese, 8 segments / 584 source
+characters, Q4_K_M quantization on both providers. These are reference numbers
+for this machine, not a guarantee for other pages; real page translation also
+depends on DOM size, cache hits, and parallel request settings.
 
 Machine:
 
-- OS: `Linux 7.0.12-zen1-1.1-zen x86_64 GNU/Linux`
+- OS: `Linux 7.1.2-zen1-1.1-zen x86_64 GNU/Linux`
 - CPU: AMD Ryzen 7 3700X 8-Core Processor / 16 threads
 - RAM: 31.3 GiB
 - GPU: NVIDIA GeForce RTX 3060, 12 GiB VRAM, driver 610.43.02
+- Ollama with its library `translategemma` models; llama.cpp b9902 (CUDA) with
+  `mradermacher/translategemma-{4b,12b}-it-GGUF:Q4_K_M`, all layers on GPU
 
-| Model | Avg wall time | Source chars/s | Avg output tokens/s |
-|-------|---------------|----------------|---------------------|
-| `translategemma:4b` | 4.12 s | 145.1 | 75.4 |
-| `translategemma:12b` | 7.29 s | 80.1 | 34.3 |
+| Model | Provider | Avg wall time | Source chars/s | Avg output tokens/s |
+|-------|----------|---------------|----------------|---------------------|
+| TranslateGemma 4B | `llamacpp` | 3.18 s | 190.4 | 94.8 |
+| TranslateGemma 4B | `ollama` | 5.04 s | 116.0 | 76.1 |
+| TranslateGemma 12B | `llamacpp` | 6.68 s | 87.4 | 36.4 |
+| TranslateGemma 12B | `ollama` | 7.27 s | 80.3 | 35.1 |
 
 ## Privacy
 
@@ -132,8 +165,8 @@ Click **Advanced Settings** to configure:
 
 | Setting | Description |
 |---------|-------------|
-| Provider | Auto-detect, Ollama only, or LMStudio only |
-| URLs | Custom endpoints for Ollama/LMStudio |
+| Provider | Auto-detect, Ollama only, LMStudio only, or llama.cpp only |
+| URLs | Custom endpoints for Ollama/LMStudio/llama.cpp |
 | Max tokens/items per batch | Control batch sizes |
 | Temperature | Model creativity (lower = more consistent) |
 | Request Format (*work in progress*) | Default JSON, Hunyuan-MT, Simple, or Custom |

@@ -67,6 +67,28 @@
 - Verified with `scratchpad/test-glossary.js` (stubbed chrome + Ollama fetch, drives the real onMessage handler): 14/14 PASS — save/info/clear, whole-segment bypass, keep-as-is, prompt hints, and cache-on behavior (exact hits not written to cache; `CACHE_COUNT` = model results only).
 - Reminder for fork: upstream cache messages are `CLEAR_CACHE`/`CACHE_COUNT`/`CACHE_BACKEND` — same names used by our merged tree.
 
+### llama.cpp / llama-server provider (2026-07-08, fork issue #3)
+
+- Added a `llamacpp` provider (OpenAI-compatible, default `http://localhost:8080`) alongside ollama/lmstudio; the extension stays a thin HTTP client (no WebGPU).
+- `background.js`: LMStudio client generalized into `OPENAI_COMPAT` table + `listOpenAICompatModels()` / `callOpenAICompat()` (`callLMStudio`/`listLMStudioModels` are gone — llamacpp and lmstudio share the `/v1` path, only base-URL setting and error label differ). `detectProviders()` rewritten around a shared `probeEndpoint()` helper and now probes all three in parallel; response gains `llamacpp`/`llamacpp_blocked`. `llamacppUrl` added to `DEFAULT_SETTINGS`.
+- UI: provider option + URL field in popup and options; `llamacppUrl` wired through DEFAULT_SETTINGS / applySettingsToUI / save / `ensureHostPermissions` in `popup.js`, `options.js`; provider-status + CORS-banner handling in `popup.js` and `translator.js` (blocked-case text says "update llama.cpp / check proxy" — llama-server allows CORS by default, unlike Ollama/LMStudio). New `.model-provider-badge--llamacpp` (blue) in `popup.css`.
+- `scripts/benchmark.rb`: `PROVIDER=llamacpp` + `LLAMACPP_URL`; `run_lmstudio` renamed `run_openai_chat`, detect tries ollama → lmstudio → llamacpp.
+- `manifest.json` unchanged: `http://localhost/*` host permission ignores ports, so :8080 is already covered. No new files, so `mkxpi.sh` untouched.
+- Validated with `scratchpad/test-llamacpp.js` (mock llama-server on :8080 + real local Ollama, drives the real onMessage handler): DETECT_PROVIDERS, auto-mode model merge, provider=llamacpp-only listing, and TRANSLATE via `/v1/chat/completions` with `response_format: json_schema` — 5/5 PASS. `benchmark.rb` llamacpp path also run against the mock.
+- Not yet done: end-to-end against a real `llama-server` (binary is installed but no .gguf on this machine) — llama-server ≥ b4600ish supports OpenAI `json_schema` response_format; older builds fall back via the existing retry/plain-text path.
+- UPDATE (same day): real E2E and benchmarks done — see the next section.
+
+### llama.cpp benchmarks + real E2E (2026-07-08)
+
+- Ollama's translategemma blobs are NOT loadable by upstream llama.cpp (`gemma3.attention.layer_norm_rms_epsilon` missing from Ollama's conversion) — downloaded `mradermacher/translategemma-{4b,12b}-it-GGUF:Q4_K_M` via `llama-server -hf` instead (lands in `~/.cache/huggingface/hub`, ~11 GB total incl. mmproj).
+- **Gotcha:** TranslateGemma's bundled jinja chat template demands a structured content mapping (`source_lang_code`/`target_lang_code`/...), so `llama-server` dies at startup with a Jinja exception on plain OpenAI messages. Fix: `--no-jinja --chat-template gemma` (builtin C++ Gemma template). Plain `--chat-template gemma` WITHOUT `--no-jinja` silently treats "gemma" as a literal jinja string — every prompt renders as the word "gemma" and the model hallucinates garbage. Documented in README's llama.cpp setup section.
+- `scripts/benchmark.rb`: OpenAI path now fills output tokens (`usage.completion_tokens`) and tokens/s (llama-server's `timings.predicted_per_second`).
+- Re-measured README "Local Reference" (2026-07-08, kernel 7.1.2, llama.cpp b9902 CUDA, Q4_K_M both providers, EN→JA):
+  - 4B: llamacpp 3.18 s / 94.8 tok/s vs ollama 5.04 s / 76.1 tok/s
+  - 12B: llamacpp 6.68 s / 36.4 tok/s vs ollama 7.27 s / 35.1 tok/s
+- Real E2E (`scratchpad/test-llamacpp-real.js`, real llama-server + real onMessage handler): DETECT_PROVIDERS, model listing, `requestFormat: auto` → `translategemma` detected from the model id, TRANSLATE returned correct Japanese for 2 segments — PASS.
+- Follow-up fix: switching Provider in the options page kept showing the old provider's models. Two causes: (1) background's 60s model cache wasn't keyed by provider — now `cachedModelsProvider` invalidates it on switch; (2) options page never reloaded the list on provider change and its refresh button didn't pass `forceRefresh` — provider change now saves immediately + reloads (`loadModels(true)`), refresh/Save force-refresh too, popup got the same provider-change listener. Regression test: `scratchpad/test-provider-switch.js` (3/3 PASS against the real llama-server).
+
 ## Handoff
 
 - Cache is now **off by default** (upstream policy). Enable it in Options → Translation Cache; selection repair works with or without it.
@@ -74,4 +96,4 @@
 - Selection repair cache keys include `promptSigFor` output — if key derivation in `translate()` changes, change the `CLEAR_TRANSLATION_CACHE_ENTRIES` handler the same way (both call the shared helper).
 - `background.js` briefly contained a literal NUL again during the merge; keep the `\u0000` escape in source (see upstream 5b5f1d5 and the fork's `.gitattributes`).
 - Validation run: `node --check` on all six JS files, duplicate-id scan on both HTML files, and a Node smoke test of `cacheDeleteKeys` / `cacheDeleteModel` (memory layer).
-- Not yet done: real-browser test (load the extension, translate a page, try Retranslate/Discard Selection and "Delete all except current model"), XPI rebuild, push/PR decision.
+- Real-browser status: llamacpp provider confirmed working in Firefox (options provider switch + model listing + page translation against a local `llama-server`); llama-server now runs as a systemd service (`/etc/conf.d/llama.cpp`, translategemma-12b). XPI rebuild for the llamacpp feature still pending (bump version + `./mkxpi.sh`).

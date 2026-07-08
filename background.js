@@ -16,9 +16,10 @@ if (typeof importScripts === 'function') {
 // ============================================================================
 
 const DEFAULT_SETTINGS = {
-    provider: 'auto', // 'auto', 'ollama', 'lmstudio'
+    provider: 'auto', // 'auto', 'ollama', 'lmstudio', 'llamacpp'
     ollamaUrl: 'http://localhost:11434',
     lmstudioUrl: 'http://localhost:1234',
+    llamacppUrl: 'http://localhost:8080',
     selectedModel: '',
     targetLanguage: 'en',
     sourceLanguage: 'auto', // 'auto' = detect from page, or specific code
@@ -75,8 +76,10 @@ Produce only the {{targetLang}} translation, without any additional explanations
     }
 };
 
-// Cache for models to avoid repeated API calls during translation
+// Cache for models to avoid repeated API calls during translation.
+// Keyed by the provider setting so switching providers invalidates it.
 let cachedModels = null;
+let cachedModelsProvider = null;
 let modelsCacheTime = 0;
 const MODEL_CACHE_TTL = 60000; // 60 seconds
 
@@ -267,64 +270,41 @@ async function buildGlossaryBlock(settings, text) {
 // Provider Detection & Model Listing
 // ============================================================================
 
-async function detectProviders(ollamaUrl, lmstudioUrl) {
-    const results = { ollama: false, ollama_blocked: false, lmstudio: false, lmstudio_blocked: false };
-
+// Probe a provider endpoint. `ok` means reachable and readable; `blocked` means
+// a normal fetch failed but a no-cors fetch succeeded — the server is running
+// yet CORS is blocking the response (opaque responses can't be read, but they
+// only resolve when the server is actually reachable).
+async function probeEndpoint(url) {
     try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 2000);
-        const response = await fetch(`${ollamaUrl}/api/tags`, {
-            method: 'GET',
-            signal: controller.signal
-        });
+        const response = await fetch(url, { method: 'GET', signal: controller.signal });
         clearTimeout(timeout);
-        results.ollama = response.ok;
+        return { ok: response.ok, blocked: false };
     } catch (e) {
-        // Normal fetch failed — could be server not running, or CORS blocking the response.
-        // Try a no-cors fetch: it gives an opaque response (can't read status/body) but
-        // will not throw if the server is reachable, only if it is truly unreachable.
         try {
             const controller2 = new AbortController();
             const timeout2 = setTimeout(() => controller2.abort(), 2000);
-            await fetch(`${ollamaUrl}/api/tags`, {
-                method: 'GET',
-                mode: 'no-cors',
-                signal: controller2.signal
-            });
+            await fetch(url, { method: 'GET', mode: 'no-cors', signal: controller2.signal });
             clearTimeout(timeout2);
-            results.ollama_blocked = true;
+            return { ok: false, blocked: true };
         } catch (_) {
-            results.ollama = false;
+            return { ok: false, blocked: false };
         }
     }
+}
 
-    try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 2000);
-        const response = await fetch(`${lmstudioUrl}/v1/models`, {
-            method: 'GET',
-            signal: controller.signal
-        });
-        clearTimeout(timeout);
-        results.lmstudio = response.ok;
-    } catch (e) {
-        // Try a no-cors fetch to see if server is running but CORS is blocking the response
-        try {
-            const controller2 = new AbortController();
-            const timeout2 = setTimeout(() => controller2.abort(), 2000);
-            await fetch(`${lmstudioUrl}/v1/models`, {
-                method: 'GET',
-                mode: 'no-cors',
-                signal: controller2.signal
-            });
-            clearTimeout(timeout2);
-            results.lmstudio_blocked = true;
-        } catch (_) {
-            results.lmstudio = false;
-        }
-    }
-
-    return results;
+async function detectProviders(ollamaUrl, lmstudioUrl, llamacppUrl) {
+    const [ollama, lmstudio, llamacpp] = await Promise.all([
+        probeEndpoint(`${ollamaUrl}/api/tags`),
+        probeEndpoint(`${lmstudioUrl}/v1/models`),
+        probeEndpoint(`${llamacppUrl}/v1/models`)
+    ]);
+    return {
+        ollama: ollama.ok, ollama_blocked: ollama.blocked,
+        lmstudio: lmstudio.ok, lmstudio_blocked: lmstudio.blocked,
+        llamacpp: llamacpp.ok, llamacpp_blocked: llamacpp.blocked
+    };
 }
 
 async function listOllamaModels(url) {
@@ -343,34 +323,45 @@ async function listOllamaModels(url) {
     }
 }
 
-async function listLMStudioModels(url) {
+// LMStudio and llama.cpp's llama-server both expose the OpenAI-compatible API
+// (GET /v1/models, POST /v1/chat/completions), so they share one client; only
+// the base URL setting and the label used in error messages differ.
+const OPENAI_COMPAT = {
+    lmstudio: { label: 'LMStudio', urlKey: 'lmstudioUrl' },
+    llamacpp: { label: 'llama.cpp', urlKey: 'llamacppUrl' }
+};
+
+async function listOpenAICompatModels(url, provider) {
+    const label = OPENAI_COMPAT[provider].label;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
     try {
         const response = await fetch(`${url}/v1/models`, { signal: controller.signal });
         clearTimeout(timeoutId);
-        if (!response.ok) throw new Error('Failed to fetch LMStudio models');
+        if (!response.ok) throw new Error(`Failed to fetch ${label} models`);
         const data = await response.json();
-        return (data.data || []).map(m => ({ id: m.id, name: m.id, provider: 'lmstudio' }));
+        return (data.data || []).map(m => ({ id: m.id, name: m.id, provider }));
     } catch (e) {
         clearTimeout(timeoutId);
-        if (e.name === 'AbortError') throw new Error('LMStudio model listing timed out');
+        if (e.name === 'AbortError') throw new Error(`${label} model listing timed out`);
         throw e;
     }
 }
 
 async function listModels(settings, useCache = true) {
-    // Return cached models if available and not expired
-    if (useCache && cachedModels && (Date.now() - modelsCacheTime < MODEL_CACHE_TTL)) {
+    const provider = settings.provider;
+
+    // Return cached models if available, not expired, and for the same provider
+    if (useCache && cachedModels && cachedModelsProvider === provider
+        && (Date.now() - modelsCacheTime < MODEL_CACHE_TTL)) {
         return cachedModels;
     }
 
     const models = [];
-    const provider = settings.provider;
 
     if (provider === 'lmstudio' || provider === 'auto') {
         try {
-            const lmstudioModels = await listLMStudioModels(settings.lmstudioUrl);
+            const lmstudioModels = await listOpenAICompatModels(settings.lmstudioUrl, 'lmstudio');
             models.push(...lmstudioModels);
         } catch (e) {
             if (provider === 'lmstudio') throw e;
@@ -386,8 +377,18 @@ async function listModels(settings, useCache = true) {
         }
     }
 
+    if (provider === 'llamacpp' || provider === 'auto') {
+        try {
+            const llamacppModels = await listOpenAICompatModels(settings.llamacppUrl, 'llamacpp');
+            models.push(...llamacppModels);
+        } catch (e) {
+            if (provider === 'llamacpp') throw e;
+        }
+    }
+
     // Update cache
     cachedModels = models;
+    cachedModelsProvider = provider;
     modelsCacheTime = Date.now();
 
     return models;
@@ -702,7 +703,8 @@ const TRANSLATION_JSON_SCHEMA = {
     "additionalProperties": false
 };
 
-async function callLMStudio(settings, modelId, systemPrompt, userPrompt, jsonOutput, cancelSignal) {
+async function callOpenAICompat(provider, settings, modelId, systemPrompt, userPrompt, jsonOutput, cancelSignal) {
+    const { label, urlKey } = OPENAI_COMPAT[provider];
     const messages = [];
 
     if (systemPrompt) {
@@ -733,7 +735,7 @@ async function callLMStudio(settings, modelId, systemPrompt, userPrompt, jsonOut
     linkCancelSignal(controller, cancelSignal);
     let response;
     try {
-        response = await fetch(`${settings.lmstudioUrl}/v1/chat/completions`, {
+        response = await fetch(`${settings[urlKey]}/v1/chat/completions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
@@ -741,9 +743,9 @@ async function callLMStudio(settings, modelId, systemPrompt, userPrompt, jsonOut
         });
     } catch (e) {
         clearTimeout(timeoutId);
-        if (e.name === 'AbortError') throw new Error('LMStudio request timed out after 5 minutes');
+        if (e.name === 'AbortError') throw new Error(`${label} request timed out after 5 minutes`);
         if (e instanceof TypeError) {
-            throw new Error('Failed to connect to LMStudio. The extension is being blocked by LMStudio\'s CORS policy or the server is offline. You need to enable CORS in LMStudio.');
+            throw new Error(`Failed to connect to ${label}. The extension is being blocked by ${label}'s CORS policy or the server is offline.`);
         }
         throw e;
     }
@@ -751,7 +753,7 @@ async function callLMStudio(settings, modelId, systemPrompt, userPrompt, jsonOut
 
     if (!response.ok) {
         const error = await response.text();
-        throw new Error(`LMStudio error: ${error}`);
+        throw new Error(`${label} error: ${error}`);
     }
 
     const data = await response.json();
@@ -768,7 +770,8 @@ async function callProvider(provider, settings, modelId, systemPrompt, userPromp
     if (provider === 'ollama') {
         return callOllama(settings, modelId, systemPrompt, userPrompt, jsonOutput, cancelSignal);
     }
-    return callLMStudio(settings, modelId, systemPrompt, userPrompt, jsonOutput, cancelSignal);
+    const compat = OPENAI_COMPAT[provider] ? provider : 'lmstudio';
+    return callOpenAICompat(compat, settings, modelId, systemPrompt, userPrompt, jsonOutput, cancelSignal);
 }
 
 // Translate a single text as plain text (no JSON), used as the last-resort
@@ -1053,7 +1056,8 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 case 'DETECT_PROVIDERS':
                     const providers = await detectProviders(
                         settings.ollamaUrl,
-                        settings.lmstudioUrl
+                        settings.lmstudioUrl,
+                        settings.llamacppUrl
                     );
                     sendResponse(providers);
                     break;

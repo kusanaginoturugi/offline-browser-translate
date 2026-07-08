@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Local LLM Translator",
   "version": "1.6.1",
-  "description": "Privacy-focused translation using local LLMs (Ollama, LMStudio). Your data never leaves your machine.",
+  "description": "Privacy-focused translation using local LLMs (Ollama, LMStudio, llama.cpp). Your data never leaves your machine.",
   "permissions": [
     "activeTab",
     "storage",

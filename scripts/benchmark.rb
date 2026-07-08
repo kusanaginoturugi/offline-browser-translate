@@ -23,7 +23,7 @@ def usage!
       PROVIDER=ollama MODEL=translategemma TARGET_LANGUAGE=Japanese ruby scripts/benchmark.rb
 
     Environment:
-      PROVIDER         auto, ollama, or lmstudio (default: auto)
+      PROVIDER         auto, ollama, lmstudio, or llamacpp (default: auto)
       MODEL            model id/name (default: first model returned by provider)
       TARGET_LANGUAGE  translation target language name (default: Japanese)
       SOURCE_LANGUAGE  source language name (default: English)
@@ -31,6 +31,7 @@ def usage!
       BENCH_WARMUP     warmup runs excluded from results (default: 1)
       OLLAMA_URL       default: http://localhost:11434
       LMSTUDIO_URL     default: http://localhost:1234
+      LLAMACPP_URL     default: http://localhost:8080
   USAGE
   exit 2
 end
@@ -58,7 +59,7 @@ def post_json(url, payload, timeout: 300)
   end
 end
 
-def detect_provider(provider, ollama_url, lmstudio_url)
+def detect_provider(provider, ollama_url, lmstudio_url, llamacpp_url)
   return provider unless provider == "auto"
 
   get_json("#{ollama_url}/api/tags")
@@ -68,16 +69,22 @@ rescue StandardError
     get_json("#{lmstudio_url}/v1/models")
     "lmstudio"
   rescue StandardError
-    raise "No provider detected. Start Ollama or LM Studio first, or set PROVIDER explicitly."
+    begin
+      get_json("#{llamacpp_url}/v1/models")
+      "llamacpp"
+    rescue StandardError
+      raise "No provider detected. Start Ollama, LM Studio or llama-server first, or set PROVIDER explicitly."
+    end
   end
 end
 
-def list_models(provider, ollama_url, lmstudio_url)
+# lmstudio and llamacpp both speak the OpenAI-compatible API (/v1).
+def list_models(provider, ollama_url, openai_url)
   if provider == "ollama"
     data = get_json("#{ollama_url}/api/tags")
     data.fetch("models", []).map { |m| m.fetch("name") }
   else
-    data = get_json("#{lmstudio_url}/v1/models")
+    data = get_json("#{openai_url}/v1/models")
     data.fetch("data", []).map { |m| m.fetch("id") }
   end
 end
@@ -103,7 +110,7 @@ def run_ollama(url, model, prompt)
   })
 end
 
-def run_lmstudio(url, model, prompt)
+def run_openai_chat(url, model, prompt)
   post_json("#{url}/v1/chat/completions", {
     model: model,
     stream: false,
@@ -145,18 +152,20 @@ def gpu_summary
 end
 
 provider = ENV.fetch("PROVIDER", "auto")
-usage! unless %w[auto ollama lmstudio].include?(provider)
+usage! unless %w[auto ollama lmstudio llamacpp].include?(provider)
 
 ollama_url = ENV.fetch("OLLAMA_URL", "http://localhost:11434")
 lmstudio_url = ENV.fetch("LMSTUDIO_URL", "http://localhost:1234")
+llamacpp_url = ENV.fetch("LLAMACPP_URL", "http://localhost:8080")
 target_language = ENV.fetch("TARGET_LANGUAGE", "Japanese")
 source_language = ENV.fetch("SOURCE_LANGUAGE", "English")
 repeat = ENV.fetch("BENCH_REPEAT", "3").to_i
 warmup = ENV.fetch("BENCH_WARMUP", "1").to_i
 usage! if repeat < 1 || warmup < 0
 
-provider = detect_provider(provider, ollama_url, lmstudio_url)
-models = list_models(provider, ollama_url, lmstudio_url)
+provider = detect_provider(provider, ollama_url, lmstudio_url, llamacpp_url)
+openai_url = provider == "llamacpp" ? llamacpp_url : lmstudio_url
+models = list_models(provider, ollama_url, openai_url)
 model = ENV["MODEL"] || models.first
 raise "No model found for #{provider}. Load a model first or set MODEL." if model.to_s.empty?
 
@@ -167,18 +176,22 @@ results = []
 
 total_runs.times do |i|
   started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-  response = provider == "ollama" ? run_ollama(ollama_url, model, prompt) : run_lmstudio(lmstudio_url, model, prompt)
+  response = provider == "ollama" ? run_ollama(ollama_url, model, prompt) : run_openai_chat(openai_url, model, prompt)
   elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
   next if i < warmup
 
-  text = if provider == "ollama"
-           response["response"].to_s
-         else
-           response.dig("choices", 0, "message", "content").to_s
-         end
-  eval_count = provider == "ollama" ? response["eval_count"].to_i : nil
-  eval_duration = provider == "ollama" ? response["eval_duration"].to_i : nil
-  tokens_per_s = eval_count && eval_duration&.positive? ? eval_count / (eval_duration / 1_000_000_000.0) : nil
+  if provider == "ollama"
+    text = response["response"].to_s
+    eval_count = response["eval_count"].to_i
+    eval_duration = response["eval_duration"].to_i
+    tokens_per_s = eval_duration.positive? ? eval_count / (eval_duration / 1_000_000_000.0) : nil
+  else
+    text = response.dig("choices", 0, "message", "content").to_s
+    # OpenAI-compatible servers report completion tokens in `usage`; llama-server
+    # additionally reports generation speed in its `timings` extension.
+    eval_count = response.dig("usage", "completion_tokens")
+    tokens_per_s = response.dig("timings", "predicted_per_second")
+  end
 
   results << {
     wall_s: elapsed,
