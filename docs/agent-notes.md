@@ -5,6 +5,7 @@
 - Merge upstream (Eldoprano/offline-browser-translate) `main` into the fork.
 - Adopt upstream's IndexedDB translation cache (`cache.js`, three-mode `cacheMode`) and remove the fork's storage.local cache.
 - Keep fork-only features working on top of it: glossary, selection repair, per-model cache deletion, benchmark.
+- Add TranslateGemma 4B-first translation routing: use 12B only for long segments or failed/suspicious 4B output, then document the local llama.cpp settings and benchmarks.
 
 ## Work Record
 
@@ -91,6 +92,21 @@
 - Real E2E (`scratchpad/test-llamacpp-real.js`, real llama-server + real onMessage handler): DETECT_PROVIDERS, model listing, `requestFormat: auto` → `translategemma` detected from the model id, TRANSLATE returned correct Japanese for 2 segments — PASS.
 - Follow-up fix: switching Provider in the options page kept showing the old provider's models. Two causes: (1) background's 60s model cache wasn't keyed by provider — now `cachedModelsProvider` invalidates it on switch; (2) options page never reloaded the list on provider change and its refresh button didn't pass `forceRefresh` — provider change now saves immediately + reloads (`loadModels(true)`), refresh/Save force-refresh too, popup got the same provider-change listener. Regression test: `scratchpad/test-provider-switch.js` (3/3 PASS against the real llama-server).
 
+### TranslateGemma 4B/12B quality routing (2026-07-16)
+
+- Added 4B-first quality routing in `background.js`:
+  - `qualityFallbackModel: 'auto'` detects a loaded TranslateGemma 12B candidate when the selected model is TranslateGemma 4B.
+  - Short segments go to 4B first; empty/malformed/suspicious results are retried on 12B.
+  - Long segments go directly to 12B when they are 120+ words or 700+ characters.
+  - 12B-produced results are not written under the 4B cache key, so future requests still follow the routing rules.
+- README now documents the routing behavior, the long-text threshold, and a Secure Shell long-routing benchmark.
+- Benchmark input: 3 segments adapted from Wikipedia "Secure Shell" (28 words, 72 words, 180 words; 1,916 source chars total). With both TranslateGemma Q4_K_M models fully GPU-offloaded on RTX 3060 12 GiB using `c = 4096`, `parallel = 1`, `n-gpu-layers = 99`:
+  - 4B only: 5.00 s / 382.9 chars/s.
+  - 4B + 12B long-text routing: 9.28 s / 206.4 chars/s, routed 2 segments to 4B and 1 long segment to 12B.
+  - 12B only: 12.30 s / 155.8 chars/s.
+- Heavier llama.cpp defaults (`c = 16384`, `parallel = 4`) made simultaneous full-GPU 4B+12B residency unreliable on 12 GiB VRAM; `c = 4096`, `parallel = 1` worked and kept GPU utilization high.
+- Validation: `node --check background.js`, `node --check languages.js`, and live local llama-server smoke/benchmark requests against temporary 4B/12B servers.
+
 ## Handoff
 
 - Cache is now **off by default** (upstream policy). Enable it in Options → Translation Cache; selection repair works with or without it.
@@ -99,3 +115,5 @@
 - `background.js` briefly contained a literal NUL again during the merge; keep the `\u0000` escape in source (see upstream 5b5f1d5 and the fork's `.gitattributes`).
 - Validation run: `node --check` on all six JS files, duplicate-id scan on both HTML files, and a Node smoke test of `cacheDeleteKeys` / `cacheDeleteModel` (memory layer).
 - Real-browser status: llamacpp provider confirmed working in Firefox (options provider switch + model listing + page translation against a local `llama-server`); llama-server now runs as a systemd service (`/etc/conf.d/llama.cpp`, translategemma-12b). XPI rebuild for the llamacpp feature still pending (bump version + `./mkxpi.sh`).
+- For TranslateGemma 4B/12B routing, prefer dedicated llama.cpp model aliases such as `translategemma-4b-translate` and `translategemma-12b-translate` with `c = 4096`, `parallel = 1`, `n-gpu-layers = 99`. The extension auto-routing only looks for 4B/12B TranslateGemma model IDs; keep both tokens in the aliases.
+- Existing unrelated local change remains in `examples/ui-labels-ja.tsv`; do not include it unless the user explicitly wants that file committed.

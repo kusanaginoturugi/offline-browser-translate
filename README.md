@@ -41,6 +41,13 @@ For GPU acceleration, use a CUDA/ROCm/Vulkan-enabled `llama.cpp` build. Recent
 `llama-server` builds allow cross-origin requests by default, so no extra CORS
 configuration is needed.
 
+If both TranslateGemma 4B and 12B are loaded, select the 4B model for normal
+use. The extension keeps short segments on 4B first; when a segment still comes
+back empty, malformed, or suspicious after retries, it can automatically retry
+just that failed segment on the loaded 12B model. Long segments (120+ words or
+700+ characters) are sent directly to 12B. It does not send every segment to
+both models.
+
 **TranslateGemma note:** the model's bundled chat template requires a special
 structured input and makes `llama-server` reject plain OpenAI-style messages
 (startup fails with a Jinja exception). Override it with a plain Gemma
@@ -183,6 +190,43 @@ Machine:
 | TranslateGemma 4B | `ollama` | 5.04 s | 116.0 | 76.1 |
 | TranslateGemma 12B | `llamacpp` | 6.68 s | 87.4 | 36.4 |
 | TranslateGemma 12B | `ollama` | 7.27 s | 80.3 | 35.1 |
+
+### Long-text Routing Reference
+
+Measured on 2026-07-16, English -> Japanese, using text adapted from the
+Wikipedia "Secure Shell" article: 3 segments / 1,916 source characters. The
+segments were 28 words, 72 words, and 180 words; only the 180-word segment
+crossed the long-text threshold and was routed to 12B.
+
+llama.cpp was run with both TranslateGemma Q4_K_M models fully offloaded to the
+GPU by reducing context and server parallelism:
+
+```ini
+[translategemma-4b-translate]
+model = /home/onoue/.local/lib/models/translategemma-4b-it.Q4_K_M.gguf
+chat-template-file = /home/onoue/.local/lib/models/gemma.jinja
+c = 4096
+parallel = 1
+n-gpu-layers = 99
+
+[translategemma-12b-translate]
+model = /home/onoue/.local/lib/models/translategemma-12b-it.Q4_K_M.gguf
+chat-template-file = /home/onoue/.local/lib/models/gemma.jinja
+c = 4096
+parallel = 1
+n-gpu-layers = 99
+```
+
+| Pattern | Avg wall time | Source chars/s | Routing |
+|---------|---------------|----------------|---------|
+| TranslateGemma 4B only | 5.00 s | 382.9 | 4B: 3 / 12B: 0 |
+| 4B + 12B long-text routing | 9.28 s | 206.4 | 4B: 2 / 12B: 1 |
+| TranslateGemma 12B only | 12.30 s | 155.8 | 4B: 0 / 12B: 3 |
+
+With the heavier default server settings (`c = 16384`, `parallel = 4`), keeping
+both 4B and 12B fully on a 12 GiB RTX 3060 was not reliable. For this extension,
+`c = 4096` and `parallel = 1` are a better fit because page text is translated
+in small segments rather than as one large document.
 
 ## Privacy
 

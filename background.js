@@ -30,6 +30,9 @@ const DEFAULT_SETTINGS = {
     customSystemPrompt: '',
     customUserPromptTemplate: '',
     requestFormat: 'auto', // 'auto' (detect from model), 'default', 'translategemma', 'hunyuan', 'simple', 'custom'
+    qualityFallbackModel: 'auto', // 'auto' = TranslateGemma 4B can retry failed segments on a loaded 12B model
+    qualityFallbackLongTextWords: 120,
+    qualityFallbackLongTextChars: 700,
     temperature: 0.3,
     useStructuredOutput: true,
     maxOutputRetries: 2,    // Extra attempts when the model returns malformed/missing translations
@@ -613,6 +616,48 @@ async function detectModelProvider(modelId, settings) {
     return model ? model.provider : null;
 }
 
+function isTranslateGemma4B(modelId) {
+    return detectRequestFormat(modelId) === 'translategemma' && /\b4b\b/i.test(modelId || '');
+}
+
+function isTranslateGemma12B(modelId) {
+    return detectRequestFormat(modelId) === 'translategemma' && /\b12b\b/i.test(modelId || '');
+}
+
+async function resolveQualityFallbackModel(settings, primaryModelId, primaryProvider) {
+    const configured = settings.qualityFallbackModel || 'auto';
+    if (configured === 'off' || configured === primaryModelId) return null;
+
+    if (configured !== 'auto') {
+        const provider = await detectModelProvider(configured, settings);
+        return provider ? { modelId: configured, provider } : null;
+    }
+
+    // Conservative auto mode: only the known fast/quality TranslateGemma pair.
+    if (!isTranslateGemma4B(primaryModelId)) return null;
+
+    const models = await listModels(settings, true);
+    const candidate = models.find(m => m.provider === primaryProvider && isTranslateGemma12B(m.id))
+        || models.find(m => isTranslateGemma12B(m.id));
+    return candidate ? { modelId: candidate.id, provider: candidate.provider } : null;
+}
+
+function countWordsForRouting(text) {
+    return (String(text || '').match(/[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)*/gu) || []).length;
+}
+
+function shouldUseQualityModelFirst(text, settings) {
+    const wordLimit = Number.isFinite(settings.qualityFallbackLongTextWords)
+        ? settings.qualityFallbackLongTextWords
+        : DEFAULT_SETTINGS.qualityFallbackLongTextWords;
+    const charLimit = Number.isFinite(settings.qualityFallbackLongTextChars)
+        ? settings.qualityFallbackLongTextChars
+        : DEFAULT_SETTINGS.qualityFallbackLongTextChars;
+    const s = String(text || '').trim();
+    if (!s) return false;
+    return countWordsForRouting(s) >= wordLimit || s.length >= charLimit;
+}
+
 // PLAIN_TEXT_FORMATS comes from languages.js (shared with the UIs).
 
 // Per-tab cancel controllers. A tab gets one shared controller while it has
@@ -830,18 +875,32 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
         if (!provider) throw new Error('Could not detect model provider');
     }
 
-    // Resolve the effective request format ('auto' -> derived from the model).
-    const format = resolveRequestFormat(settings, modelId);
-    const isPlainText = PLAIN_TEXT_FORMATS.has(format);
-    const template = PROMPT_TEMPLATES[format] || PROMPT_TEMPLATES.default;
+    const makeModelContext = (ctxModelId, ctxProvider) => {
+        // Resolve the effective request format ('auto' -> derived from the model).
+        const format = resolveRequestFormat(settings, ctxModelId);
+        const isPlainText = PLAIN_TEXT_FORMATS.has(format);
+        const template = PROMPT_TEMPLATES[format] || PROMPT_TEMPLATES.default;
 
-    // Use custom prompts if advanced mode is enabled
-    let systemTemplate = template.system;
-    let userTemplate = template.user;
-    if (settings.useAdvanced) {
-        if (settings.customSystemPrompt) systemTemplate = settings.customSystemPrompt;
-        if (settings.customUserPromptTemplate) userTemplate = settings.customUserPromptTemplate;
-    }
+        // Use custom prompts if advanced mode is enabled.
+        let systemTemplate = template.system;
+        let userTemplate = template.user;
+        if (settings.useAdvanced) {
+            if (settings.customSystemPrompt) systemTemplate = settings.customSystemPrompt;
+            if (settings.customUserPromptTemplate) userTemplate = settings.customUserPromptTemplate;
+        }
+
+        return {
+            modelId: ctxModelId,
+            provider: ctxProvider,
+            format,
+            isPlainText,
+            systemTemplate,
+            userTemplate,
+            wantJson: !!settings.useStructuredOutput && !isPlainText
+        };
+    };
+
+    const primaryCtx = makeModelContext(modelId, provider);
 
     // Template variables shared across attempts
     const targetLangName = getLanguageName(targetLanguage);
@@ -856,24 +915,21 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
         targetCode: targetLanguage.toUpperCase()
     };
 
-    // Whether to request schema-constrained JSON for this (structured) format.
-    const wantJson = !!settings.useStructuredOutput && !isPlainText;
-
     // Run one batched request for the given subset of items, returning a Map of
     // id -> good translation text (suspicious/empty results are dropped).
-    const requestBatch = async (items) => {
+    const requestBatch = async (ctx, items) => {
         // Map items to 0-indexed sequential IDs for the prompt to avoid confusing the LLM
         const mappedItems = items.map((item, index) => ({ id: index, text: item.text, originalId: item.id }));
         
         const vars = { ...baseVars, texts: formatTextsForPrompt(mappedItems) };
-        let userPrompt = buildPrompt(userTemplate, vars);
-        const systemPrompt = buildPrompt(systemTemplate, vars);
+        let userPrompt = buildPrompt(ctx.userTemplate, vars);
+        const systemPrompt = buildPrompt(ctx.systemTemplate, vars);
 
         // Prepend matching glossary terms so the model keeps proper nouns
         // consistent. Empty when the glossary is off/unmatched (prompt unchanged).
         const glossaryBlock = await buildGlossaryBlock(settings, mappedItems.map(m => m.text).join('\n'));
         if (glossaryBlock) userPrompt = `${glossaryBlock}\n\n${userPrompt}`;
-        const raw = await callProvider(provider, settings, modelId, systemPrompt, userPrompt, wantJson, cancelSignal);
+        const raw = await callProvider(ctx.provider, settings, ctx.modelId, systemPrompt, userPrompt, ctx.wantJson, cancelSignal);
         debugLog(`[Background] Raw LLM response (first 300 chars):`, (raw || '').substring(0, 300));
         
         // Parse using the mapped items so it expects 0, 1, 2...
@@ -892,6 +948,7 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
     };
 
     const results = new Map();          // originalId -> final translated text
+    const resultSources = new Map();    // originalId -> 'primary' | 'fallback'
 
     // ---- Cache + de-duplication --------------------------------------------
     // Group items by a key capturing everything that determines the model output
@@ -970,34 +1027,84 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
     // Attempt the batched request, retrying only the items that came back
     // missing or malformed. maxOutputRetries extra attempts after the first.
     const maxRetries = Number.isInteger(settings.maxOutputRetries) ? settings.maxOutputRetries : 2;
-    debugLog(`[Background] translate: provider=${provider} model=${modelId} format=${format} items=${textItems.length} json=${wantJson}`);
-    for (let attempt = 0; attempt <= maxRetries && pending.length > 0; attempt++) {
-        let good;
+    debugLog(`[Background] translate: provider=${provider} model=${modelId} format=${primaryCtx.format} items=${textItems.length} json=${primaryCtx.wantJson}`);
+
+    const runAttempts = async (ctx, items, source, retries) => {
+        let stillPending = items;
+        for (let attempt = 0; attempt <= retries && stillPending.length > 0; attempt++) {
+            let good;
+            try {
+                good = await requestBatch(ctx, stillPending);
+            } catch (e) {
+                if (attempt === retries) throw e; // bubble transport errors on last try
+                debugWarn(`[Background] ${source} batch attempt ${attempt + 1} threw:`, e.message);
+                continue;
+            }
+            for (const item of stillPending) {
+                const text = good.get(item.id);
+                if (text !== undefined) {
+                    results.set(item.id, text);
+                    resultSources.set(item.id, source);
+                }
+            }
+            stillPending = stillPending.filter(item => !results.has(item.id));
+            if (stillPending.length) {
+                debugWarn(`[Background] ${stillPending.length} item(s) malformed/missing after ${source} attempt ${attempt + 1}`);
+            }
+        }
+        return stillPending;
+    };
+
+    let fallback = null;
+    let fallbackCtx = null;
+    if (pending.length > 0) {
+        fallback = await resolveQualityFallbackModel(settings, modelId, provider);
+        if (fallback) fallbackCtx = makeModelContext(fallback.modelId, fallback.provider);
+    }
+
+    try {
+        if (fallbackCtx) {
+            const primaryItems = [];
+            const qualityFirstItems = [];
+            for (const item of pending) {
+                if (shouldUseQualityModelFirst(item.text, settings)) qualityFirstItems.push(item);
+                else primaryItems.push(item);
+            }
+
+            if (qualityFirstItems.length) {
+                debugWarn(`[Background] Routing ${qualityFirstItems.length} long item(s) directly to quality fallback model=${fallback.modelId}`);
+                const stillLongPending = await runAttempts(fallbackCtx, qualityFirstItems, 'fallback', maxRetries);
+                pending = primaryItems.concat(stillLongPending);
+            } else {
+                pending = primaryItems;
+            }
+        }
+
+        pending = await runAttempts(primaryCtx, pending, 'primary', maxRetries);
+    } catch (e) {
+        throw e;
+    }
+
+    if (pending.length > 0 && fallbackCtx) {
+        debugWarn(`[Background] Retrying ${pending.length} item(s) with quality fallback model=${fallback.modelId} provider=${fallback.provider}`);
         try {
-            good = await requestBatch(pending);
+            pending = await runAttempts(fallbackCtx, pending, 'fallback', maxRetries);
         } catch (e) {
-            if (attempt === maxRetries) throw e; // bubble transport errors on last try
-            debugWarn(`[Background] batch attempt ${attempt + 1} threw:`, e.message);
-            continue;
-        }
-        for (const item of pending) {
-            const text = good.get(item.id);
-            if (text !== undefined) results.set(item.id, text);
-        }
-        pending = pending.filter(item => !results.has(item.id));
-        if (pending.length) {
-            debugWarn(`[Background] ${pending.length} item(s) malformed/missing after attempt ${attempt + 1}`);
+            debugWarn(`[Background] quality fallback failed:`, e.message);
         }
     }
 
     // Plain-text fallback: translate the still-failing items one-by-one with no
     // structure to parse. Only for JSON-style formats (plain formats already are).
-    if (pending.length > 0 && !isPlainText && settings.plainTextFallback !== false) {
+    if (pending.length > 0 && !primaryCtx.isPlainText && settings.plainTextFallback !== false) {
         debugWarn(`[Background] Falling back to plain-text translation for ${pending.length} item(s)`);
         for (const item of pending) {
             try {
                 const text = await translatePlainItem(provider, settings, modelId, item.text, baseVars, cancelSignal);
-                if (text && !isSuspiciousTranslation(text)) results.set(item.id, text);
+                if (text && !isSuspiciousTranslation(text)) {
+                    results.set(item.id, text);
+                    resultSources.set(item.id, 'primary');
+                }
             } catch (e) {
                 debugWarn(`[Background] plain-text fallback failed for id ${item.id}:`, e.message);
             }
@@ -1009,7 +1116,9 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
     if (cacheEnabled) {
         const entries = [];
         for (const g of missGroups) {
-            if (results.has(g.item.id)) entries.push([g.key, results.get(g.item.id)]);
+            if (results.has(g.item.id) && resultSources.get(g.item.id) !== 'fallback') {
+                entries.push([g.key, results.get(g.item.id)]);
+            }
         }
         if (entries.length) {
             try { await cacheSetMany(entries); }
