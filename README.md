@@ -305,6 +305,37 @@ The QAT model reduced wall-clock time by 43.9% and increased generation
 throughput by 58.9% in this test. It is a strong speed option, but evaluate
 translation quality on the target content before making it the default.
 
+### Local Model Compatibility Notes
+
+These are functional checks on this machine's llama.cpp server and this
+extension, not quality or throughput benchmarks.
+
+| Model | Intended use | Extension result | Notes |
+|---|---|---|---|
+| TranslateGemma 4B / 12B | Translation | Works | Use the fixed TranslateGemma prompt format described above. |
+| Gemma 4 E4B IT | General instruction model | Works | See the reference benchmarks above. |
+| `Gemma-4-E4B-Uncensored` | General / multimodal | Works | Its `mmproj` must be an absolute path, not just a filename. |
+| `gemma-4-12B-QAT-Uncensored` | General instruction model | Works | MTP draft decoding works with `spec-type = draft-mtp`. |
+| [`vntl-llama3-8b-v2-gguf`](https://huggingface.co/lmg-anon/vntl-llama3-8b-v2-gguf) | Japanese visual-novel → English translation | Does not work | The model loaded in llama.cpp, but did not produce usable translations through this extension. The prompt/template/output-format mismatch has not been isolated. |
+
+The VNTL model card recommends the default Llama 3 prompt format and
+temperature `0`; that may help a direct llama.cpp client, but it was not enough
+for this extension's translation workflow.
+
+For the multimodal E4B model, download the projector separately:
+
+```sh
+llama download \
+  -hf HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive \
+  -hff mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf
+```
+
+Then point `mmproj` at its full path in the Hugging Face cache, for example:
+
+```ini
+mmproj = /home/onoue/.cache/huggingface/hub/models--HauhauCS--Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/snapshots/<revision>/mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf
+```
+
 ## Privacy
 
 This extension is designed to be privacy-focused:
