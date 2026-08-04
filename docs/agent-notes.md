@@ -164,3 +164,9 @@
 - Safe local fix: keep `--host 127.0.0.1` and pass the extension origin only, e.g. `--cors-origins "moz-extension://ca462efa-9eb3-47a8-b32e-c8f6d7b859c9"`. When copying from a script URL like `/languages.js`, strip the path; CORS origin is scheme + host only.
 - `--cors-origins "*"` works but is broader than needed. `--cors-origins "localhost,moz-extension://..."` can fail on this llama.cpp build because the server returns the comma-separated string literally, while Firefox expects a single matching `Access-Control-Allow-Origin` value.
 - Direct use of the built-in `llama-server` Web UI at `http://127.0.0.1:8080` does not require adding `localhost` to CORS.
+
+### Local model compatibility checks (2026-07-31)
+
+- Added `vntl-llama3-8b-v2` (`lmg-anon/vntl-llama3-8b-v2-gguf:Q8_0`) as a Japanese visual-novel translation candidate. It loaded in llama.cpp but did not produce usable output through offline-browser-translate. The model card recommends default Llama 3 chat format and temperature `0`; the extension-specific prompt/template/output mismatch remains unisolated.
+- `Gemma-4-E4B-Uncensored` and `gemma-4-12B-QAT-Uncensored` worked in the extension. The former requires `mmproj` to name the full path in the Hugging Face cache; `llama download -hf HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive -hff mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf` fetches the projector.
+- README now has a functional compatibility table. It deliberately keeps these checks separate from the existing fixed-input performance benchmarks.
