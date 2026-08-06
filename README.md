@@ -305,6 +305,37 @@ The QAT model reduced wall-clock time by 43.9% and increased generation
 throughput by 58.9% in this test. It is a strong speed option, but evaluate
 translation quality on the target content before making it the default.
 
+### Completion-length Comparison
+
+Measured on 2026-08-06 through the llama.cpp router on the same RTX 3060 12
+GiB machine. The request contained 8 English segments (1,218 source
+characters), used `temperature = 0`, disabled prompt caching, and allowed up
+to 4,096 completion tokens. Each result is the average of three runs after one
+warmup. Unlike a fixed-output benchmark, this records the time required for
+each model to finish naturally (`finish_reason = stop`).
+
+| Model | Avg wall time | Prompt eval | Prompt tok/s | Eval | Eval tok/s | Completion tokens |
+|-------|---------------|-------------|--------------|------|------------|-------------------|
+| TranslateGemma 4B | **5.18 s** | 127 ms | 2,572.2 | 5.03 s | 94.1 | 473 |
+| Gemma 4 E4B IT QAT | 8.38 s | 151 ms | 2,180.0 | 8.22 s | **204.1** | 1,677 |
+| TranslateGemma 12B | 10.51 s | 362 ms | 904.4 | 10.10 s | 38.8 | 392 |
+| LFM 2.5 2.6B | 19.03 s | **81 ms** | **4,037.2** | 18.94 s | 127.4 | **2,414** |
+| Gemma 4 12B IT QAT Imatrix | 33.71 s | 392 ms | 839.7 | 33.29 s | 62.9 | 2,093 |
+
+All five models stopped before the 4,096-token limit. This matters for
+translation latency: LFM 2.5 2.6B evaluates prompts and generates tokens
+quickly, but it produced about five times as many completion tokens as
+TranslateGemma 4B for this request. Its faster `eval tok/s` therefore does not
+translate to a faster completed translation. The extra completion length is
+consistent with a reasoning-oriented model spending more work on a simple
+translation task; inspect the actual translation quality before treating that
+as a universal conclusion.
+
+These figures compare the current per-model llama.cpp presets, including their
+quantization, context, parallelism, and speculative-decoding settings. They
+are useful for choosing a model on this machine, not as hardware-independent
+scores.
+
 ## Privacy
 
 This extension is designed to be privacy-focused:
