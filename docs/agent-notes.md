@@ -164,3 +164,8 @@
 - Safe local fix: keep `--host 127.0.0.1` and pass the extension origin only, e.g. `--cors-origins "moz-extension://ca462efa-9eb3-47a8-b32e-c8f6d7b859c9"`. When copying from a script URL like `/languages.js`, strip the path; CORS origin is scheme + host only.
 - `--cors-origins "*"` works but is broader than needed. `--cors-origins "localhost,moz-extension://..."` can fail on this llama.cpp build because the server returns the comma-separated string literally, while Firefox expects a single matching `Access-Control-Allow-Origin` value.
 - Direct use of the built-in `llama-server` Web UI at `http://127.0.0.1:8080` does not require adding `localhost` to CORS.
+
+### Persistent install via mkxpi.sh --install (2026-10-01)
+
+- Daily use moved from `about:debugging` temporary loading to a permanent unsigned install in Firefox Developer Edition (profile `12o3pm8y.default-aurora`). The user set `xpinstall.signatures.required = false` themselves; agents should not change browser security prefs.
+- `./mkxpi.sh --install` builds the xpi and passes its absolute path to `${FIREFOX:-firefox-developer-edition}`, which shows the install prompt in the running instance. Same add-on ID, so re-running updates in place.
