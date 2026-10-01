@@ -172,6 +172,49 @@ function invalidateGlossary() {
     glossarySig = null;
 }
 
+// Add or replace one entry from the popup's quick-add form. Unlike importing a
+// TSV, this preserves existing entries and makes the in-extension glossary the
+// immediate source of truth. A target language is set for a new inline glossary
+// so terms are never accidentally reused for another output language.
+async function upsertGlossaryEntry(source, translation, targetLanguage) {
+    const src = typeof source === 'string' ? source.trim() : '';
+    const tgt = typeof translation === 'string' ? translation.trim() : '';
+    const language = typeof targetLanguage === 'string'
+        ? targetLanguage.split('-')[0].toLowerCase()
+        : '';
+    if (!src || !tgt) throw new Error('Source and translation are required');
+
+    const entries = await loadGlossary();
+    if (glossaryTargetLang && language && glossaryTargetLang !== language) {
+        throw new Error(`Glossary is configured for ${glossaryTargetLang}, not ${language}`);
+    }
+
+    const bySource = new Map();
+    for (const entry of entries) {
+        const existingSource = entry && typeof entry[0] === 'string' ? entry[0].trim() : '';
+        if (existingSource) bySource.set(existingSource, entry[1] || '');
+    }
+    bySource.set(src, tgt);
+
+    const stored = await browserAPI.storage.local.get(GLOSSARY_META_KEY);
+    const existingMeta = stored[GLOSSARY_META_KEY] || {};
+    const meta = {
+        name: existingMeta.name || 'Built-in glossary',
+        // Keep legacy/imported all-language glossaries all-language. A newly
+        // created inline glossary is scoped to the current output language.
+        target: glossaryTargetLang || (entries.length === 0 ? language : ''),
+        loadedAt: Date.now()
+    };
+    await browserAPI.storage.local.set({
+        [GLOSSARY_KEY]: [...bySource.entries()],
+        [GLOSSARY_META_KEY]: meta
+    });
+    invalidateGlossary();
+    // The same source can now produce a different output.
+    if (typeof cacheClear === 'function') await cacheClear();
+    return { count: bySource.size, target: meta.target };
+}
+
 // A glossary maps source terms to ONE target language. When the TSV declares it
 // (via a `#target: xx` line), only apply the glossary when translating into that
 // language — otherwise a Japanese dictionary would inject Japanese into a
@@ -1454,6 +1497,28 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                         // First rows only: enough to eyeball the dictionary without
                         // shipping tens of thousands of pairs to the options page.
                         preview: entries.slice(0, GLOSSARY_PREVIEW_MAX)
+                    });
+                    break;
+                }
+
+                case 'UPSERT_GLOSSARY_ENTRY': {
+                    const result = await upsertGlossaryEntry(
+                        message.source,
+                        message.translation,
+                        message.targetLanguage || settings.targetLanguage
+                    );
+                    sendResponse({ ok: true, ...result });
+                    break;
+                }
+
+                case 'EXPORT_GLOSSARY': {
+                    const entries = await loadGlossary();
+                    const result = await browserAPI.storage.local.get(GLOSSARY_META_KEY);
+                    const meta = result[GLOSSARY_META_KEY] || {};
+                    sendResponse({
+                        entries,
+                        target: meta.target || '',
+                        name: meta.name || 'glossary'
                     });
                     break;
                 }

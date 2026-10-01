@@ -1228,6 +1228,21 @@ async function discardSelectedTranslation(targetLanguage, sourceLanguage = 'auto
     }
 }
 
+// Return the original source segments behind the current selection. This lets
+// the popup prefill a glossary entry even after the page text was replaced by a
+// translation. The input remains editable because a selected sentence is often
+// narrowed to a shorter term before saving.
+function getSelectedGlossaryContext() {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+        return { ok: false, error: 'No text selected' };
+    }
+    const items = extractSelectionTextNodes(selection);
+    const sources = [...new Set(items.map(item => item.text.trim()).filter(Boolean))];
+    if (!sources.length) return { ok: false, error: 'No translatable text in selection' };
+    return { ok: true, source: sources.join(' '), segments: sources.length };
+}
+
 // Listen for messages from background/popup
 browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // console.log(`[Translator] Received message: ${message.type}`, message);
@@ -1264,6 +1279,10 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
             discardSelectedTranslation(message.targetLanguage || currentTargetLanguage, message.sourceLanguage)
                 .then(sendResponse);
             return true;
+
+        case 'GET_SELECTION_GLOSSARY_CONTEXT':
+            sendResponse(getSelectedGlossaryContext());
+            return false;
 
         case 'SET_GLOW':
             showGlow = message.enabled;

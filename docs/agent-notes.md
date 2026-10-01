@@ -176,3 +176,10 @@
 
 - Daily use moved from `about:debugging` temporary loading to a permanent unsigned install in Firefox Developer Edition (profile `12o3pm8y.default-aurora`). The user set `xpinstall.signatures.required = false` themselves; agents should not change browser security prefs.
 - `./mkxpi.sh --install` builds the xpi and passes its absolute path to `${FIREFOX:-firefox-developer-edition}`, which shows the install prompt in the running instance. Same add-on ID, so re-running updates in place.
+
+### Closed details deferral and glossary quick-add (2026-10-01)
+
+- `content.js` skips text inside a closed `<details>` (its direct `<summary>` stays translatable) and translates the section when a captured `toggle` event reports it opened. Headings / `[role="heading"]` and `summary` get a large priority boost so structure is translated first.
+- Popup "Add to Glossary" reads the original source text behind the current selection (`GET_SELECTION_GLOSSARY_CONTEXT`) and saves one term via `UPSERT_GLOSSARY_ENTRY`. It merges into the stored glossary, refuses entries for a different `#target`, scopes a brand-new glossary to the current target language, and clears the translation cache.
+- Options → Glossary has "Export TSV" (`EXPORT_GLOSSARY`), writing `#target:` plus `source<TAB>translation` lines.
+- Committed from the user's working tree; `node --check` passes. Browser behavior was not re-verified by the agent at commit time.

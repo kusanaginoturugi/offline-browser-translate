@@ -58,6 +58,11 @@ const elements = {
     restoreBtn: document.getElementById('restoreBtn'),
     retranslateSelectionBtn: document.getElementById('retranslateSelectionBtn'),
     discardSelectionBtn: document.getElementById('discardSelectionBtn'),
+    addGlossaryEntryBtn: document.getElementById('addGlossaryEntryBtn'),
+    glossaryEntryForm: document.getElementById('glossaryEntryForm'),
+    glossarySource: document.getElementById('glossarySource'),
+    glossaryTranslation: document.getElementById('glossaryTranslation'),
+    cancelGlossaryEntryBtn: document.getElementById('cancelGlossaryEntryBtn'),
     toggleAdvanced: document.getElementById('toggleAdvanced'),
     advancedSection: document.getElementById('advancedSection'),
     providerSelect: document.getElementById('providerSelect'),
@@ -939,6 +944,45 @@ async function runSelectionCommand(type) {
     }
 }
 
+async function openGlossaryEntryForm() {
+    try {
+        const [tab] = await browserAPI.tabs.query({ active: true, currentWindow: true });
+        assertTranslatableTab(tab);
+        await ensureContentScript(tab);
+        const response = await browserAPI.tabs.sendMessage(tab.id, { type: 'GET_SELECTION_GLOSSARY_CONTEXT' });
+        if (!response?.ok) throw new Error(response?.error || 'Could not read selected text');
+        elements.glossarySource.value = response.source;
+        elements.glossaryTranslation.value = '';
+        elements.glossaryEntryForm.hidden = false;
+        elements.glossaryTranslation.focus();
+    } catch (e) {
+        showToast(`Error: ${e.message}`, 'error');
+    }
+}
+
+async function saveGlossaryEntry(event) {
+    event.preventDefault();
+    const source = elements.glossarySource.value.trim();
+    const translation = elements.glossaryTranslation.value.trim();
+    if (!source || !translation) {
+        showToast('Enter both source and preferred translation', 'error');
+        return;
+    }
+    try {
+        const response = await browserAPI.runtime.sendMessage({
+            type: 'UPSERT_GLOSSARY_ENTRY',
+            source,
+            translation,
+            targetLanguage: currentSettings.targetLanguage
+        });
+        if (!response?.ok) throw new Error(response?.error || 'Could not save glossary entry');
+        elements.glossaryEntryForm.hidden = true;
+        showToast(`Saved to glossary (${response.count} terms)`);
+    } catch (e) {
+        showToast(`Error: ${e.message}`, 'error');
+    }
+}
+
 // Reset the translate button back to its idle state
 function resetTranslateButton() {
     isTranslating = false;
@@ -1109,6 +1153,18 @@ function setupEventListeners() {
     if (elements.discardSelectionBtn) {
         elements.discardSelectionBtn.addEventListener('click', () => {
             runSelectionCommand('DISCARD_SELECTION_TRANSLATION');
+        });
+    }
+
+    if (elements.addGlossaryEntryBtn) {
+        elements.addGlossaryEntryBtn.addEventListener('click', openGlossaryEntryForm);
+    }
+    if (elements.glossaryEntryForm) {
+        elements.glossaryEntryForm.addEventListener('submit', saveGlossaryEntry);
+    }
+    if (elements.cancelGlossaryEntryBtn) {
+        elements.cancelGlossaryEntryBtn.addEventListener('click', () => {
+            elements.glossaryEntryForm.hidden = true;
         });
     }
 

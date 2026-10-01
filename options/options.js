@@ -105,6 +105,7 @@ const elements = {
     glossaryStatus: document.getElementById('glossaryStatus'),
     glossaryPreview: document.getElementById('glossaryPreview'),
     glossaryTerms: document.getElementById('glossaryTerms'),
+    exportGlossary: document.getElementById('exportGlossary'),
     clearGlossary: document.getElementById('clearGlossary'),
     floatingButton: document.getElementById('floatingButton'),
     customPromptsSection: document.getElementById('customPromptsSection'),
@@ -505,6 +506,24 @@ async function refreshGlossaryStatus() {
     elements.glossaryPreview.hidden = false;
 }
 
+function downloadGlossaryTSV(entries, target) {
+    const lines = [];
+    if (target) lines.push(`#target: ${target}`);
+    for (const entry of entries) {
+        const source = entry && typeof entry[0] === 'string' ? entry[0] : '';
+        if (!source) continue;
+        const translation = entry[1] === undefined || entry[1] === null ? '' : String(entry[1]);
+        lines.push(`${source}\t${translation}`);
+    }
+    const blob = new Blob([`${lines.join('\n')}\n`], { type: 'text/tab-separated-values;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'glossary.tsv';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 // Show toast notification
 function showToast(message, type = 'success', duration = 3000) {
     const toast = elements.toast;
@@ -644,6 +663,23 @@ function setupEventListeners() {
                 showToast('Failed to read file', 'error');
             } finally {
                 e.target.value = ''; // allow re-loading the same file
+            }
+        });
+    }
+
+    // Glossary: export the current in-extension dictionary as TSV.
+    if (elements.exportGlossary) {
+        elements.exportGlossary.addEventListener('click', async () => {
+            try {
+                const res = await browserAPI.runtime.sendMessage({ type: 'EXPORT_GLOSSARY' });
+                if (!res || !Array.isArray(res.entries) || !res.entries.length) {
+                    showToast('No glossary entries to export', 'error');
+                    return;
+                }
+                downloadGlossaryTSV(res.entries, res.target);
+                showToast(`Exported ${res.entries.length} glossary terms`);
+            } catch (e) {
+                showToast('Failed to export glossary', 'error');
             }
         });
     }

@@ -383,6 +383,8 @@ To avoid re-translating the same text over and over (forum boilerplate, menus, u
 
 Load a TSV dictionary (Options → Glossary) to pin translations for specific terms. Each line is `source<TAB>translation`; leave the second column empty to keep the term untranslated. Matching is case-sensitive. A `#target: ja` line declares the language the glossary translates into — the glossary is then only applied when that target language is selected (recommended, since a glossary maps terms into one specific language).
 
+To fix a translation while reading, select the translated segment, open the popup, click **Add to Glossary**, adjust the prefilled source if necessary, and enter the preferred translation. The term is saved immediately in the extension's local glossary and takes effect on subsequent translations. Use **Export TSV** in Options → Glossary to download the current built-in glossary.
+
 It works at two levels:
 
 - **Inside sentences** — glossary terms found in the text being translated are injected into the prompt as hard hints, so the model keeps proper nouns consistent (e.g. *The Companions* → *同胞団* everywhere). Only matching terms are sent, so a large dictionary is fine.
