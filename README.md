@@ -139,6 +139,10 @@ Developer Edition / Nightly / ESR with `xpinstall.signatures.required = false`):
 An xpi is just a zip with `manifest.json` at the root, so no signing or `web-ext`
 is needed. Bump `version` in `manifest.json` and re-run `./mkxpi.sh` to update.
 
+`./mkxpi.sh --install` builds and then opens the xpi in
+`firefox-developer-edition` (override with `FIREFOX=...`), so the install
+prompt appears in the running browser. Re-run it after changes to update.
+
 ### Chrome / Chromium
 1. Go to `chrome://extensions`
 2. Enable **Developer mode**

@@ -171,3 +171,8 @@
 - The extension's LM Studio / OpenAI-compatible model picker now has an opt-in `filterLlamaCppUiModels` setting, exposed in both Options and the popup's Advanced Settings as “For llama.cpp, show only models with `ui = true`”. It defaults to off so LM Studio and existing OpenAI-compatible servers keep their full lists.
 - llama.cpp router returns each rendered model preset in `/v1/models`; its `ui` option is serialized as `webui`. When the setting is enabled, the background filters only entries whose preset says `webui = false`. Models from LM Studio/vLLM and servers without this router-specific metadata remain visible.
 - Model-list caching is keyed by both provider selection and this filter setting, so toggling it cannot return the prior unfiltered list. User verified the behavior in Firefox after reloading the extension.
+
+### Persistent install via mkxpi.sh --install (2026-10-01)
+
+- Daily use moved from `about:debugging` temporary loading to a permanent unsigned install in Firefox Developer Edition (profile `12o3pm8y.default-aurora`). The user set `xpinstall.signatures.required = false` themselves; agents should not change browser security prefs.
+- `./mkxpi.sh --install` builds the xpi and passes its absolute path to `${FIREFOX:-firefox-developer-edition}`, which shows the install prompt in the running instance. Same add-on ID, so re-running updates in place.
