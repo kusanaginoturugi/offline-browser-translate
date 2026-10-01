@@ -86,7 +86,20 @@
         <button id="discardSelectionBtn" class="danger-btn small" title="Restore selected text and forget its cached translation">
           Discard Selection
         </button>
+        <button id="addGlossaryEntryBtn" class="secondary-btn small selection-action-wide" title="Save the selected source text with your preferred translation">
+          Add to Glossary
+        </button>
       </div>
+      <form id="glossaryEntryForm" class="glossary-entry-form" hidden>
+        <label for="glossarySource">Source</label>
+        <input id="glossarySource" type="text" autocomplete="off" required>
+        <label for="glossaryTranslation">Preferred translation</label>
+        <input id="glossaryTranslation" type="text" autocomplete="off" required>
+        <div class="button-row">
+          <button type="submit" class="primary-btn small">Save term</button>
+          <button id="cancelGlossaryEntryBtn" type="button" class="secondary-btn small">Cancel</button>
+        </div>
+      </form>
     </section>
 
     <section class="settings-toggle">
@@ -124,6 +137,11 @@
       <div class="form-group">
         <label for="lmstudioUrl">LMStudio / OpenAI-compatible URL (llama.cpp, vLLM…)</label>
         <input type="text" id="lmstudioUrl" placeholder="http://localhost:1234">
+      </div>
+
+      <div class="form-group checkbox-group">
+        <input type="checkbox" id="filterLlamaCppUiModels">
+        <label for="filterLlamaCppUiModels">For llama.cpp, show only models with ui = true</label>
       </div>
 
       <div class="form-group">

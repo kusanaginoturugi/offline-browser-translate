@@ -10,6 +10,7 @@ const DEFAULT_SETTINGS = {
     provider: 'auto',
     ollamaUrl: 'http://localhost:11434',
     lmstudioUrl: 'http://localhost:1234',
+    filterLlamaCppUiModels: false,
     selectedModel: '',
     targetLanguage: 'en',
     sourceLanguage: 'auto',
@@ -57,11 +58,17 @@ const elements = {
     restoreBtn: document.getElementById('restoreBtn'),
     retranslateSelectionBtn: document.getElementById('retranslateSelectionBtn'),
     discardSelectionBtn: document.getElementById('discardSelectionBtn'),
+    addGlossaryEntryBtn: document.getElementById('addGlossaryEntryBtn'),
+    glossaryEntryForm: document.getElementById('glossaryEntryForm'),
+    glossarySource: document.getElementById('glossarySource'),
+    glossaryTranslation: document.getElementById('glossaryTranslation'),
+    cancelGlossaryEntryBtn: document.getElementById('cancelGlossaryEntryBtn'),
     toggleAdvanced: document.getElementById('toggleAdvanced'),
     advancedSection: document.getElementById('advancedSection'),
     providerSelect: document.getElementById('providerSelect'),
     ollamaUrl: document.getElementById('ollamaUrl'),
     lmstudioUrl: document.getElementById('lmstudioUrl'),
+    filterLlamaCppUiModels: document.getElementById('filterLlamaCppUiModels'),
     maxTokens: document.getElementById('maxTokens'),
     maxItems: document.getElementById('maxItems'),
     temperature: document.getElementById('temperature'),
@@ -577,6 +584,7 @@ function applySettingsToUI() {
     elements.providerSelect.value = currentSettings.provider;
     elements.ollamaUrl.value = currentSettings.ollamaUrl;
     elements.lmstudioUrl.value = currentSettings.lmstudioUrl;
+    elements.filterLlamaCppUiModels.checked = !!currentSettings.filterLlamaCppUiModels;
     elements.maxTokens.value = currentSettings.maxTokensPerBatch;
     elements.maxItems.value = currentSettings.maxItemsPerBatch || 8;
     elements.temperature.value = currentSettings.temperature;
@@ -829,6 +837,7 @@ async function saveCurrentSettings() {
         provider: elements.providerSelect.value,
         ollamaUrl: elements.ollamaUrl.value,
         lmstudioUrl: elements.lmstudioUrl.value,
+        filterLlamaCppUiModels: elements.filterLlamaCppUiModels.checked,
         selectedModel: modelPicker.getValue(),
         pinnedModels: [...modelPicker.pinned],
         targetLanguage: langPicker.getValue(),
@@ -932,6 +941,45 @@ async function runSelectionCommand(type) {
         showToast(`Error: ${e.message}`, 'error');
     } finally {
         activeButton.disabled = false;
+    }
+}
+
+async function openGlossaryEntryForm() {
+    try {
+        const [tab] = await browserAPI.tabs.query({ active: true, currentWindow: true });
+        assertTranslatableTab(tab);
+        await ensureContentScript(tab);
+        const response = await browserAPI.tabs.sendMessage(tab.id, { type: 'GET_SELECTION_GLOSSARY_CONTEXT' });
+        if (!response?.ok) throw new Error(response?.error || 'Could not read selected text');
+        elements.glossarySource.value = response.source;
+        elements.glossaryTranslation.value = '';
+        elements.glossaryEntryForm.hidden = false;
+        elements.glossaryTranslation.focus();
+    } catch (e) {
+        showToast(`Error: ${e.message}`, 'error');
+    }
+}
+
+async function saveGlossaryEntry(event) {
+    event.preventDefault();
+    const source = elements.glossarySource.value.trim();
+    const translation = elements.glossaryTranslation.value.trim();
+    if (!source || !translation) {
+        showToast('Enter both source and preferred translation', 'error');
+        return;
+    }
+    try {
+        const response = await browserAPI.runtime.sendMessage({
+            type: 'UPSERT_GLOSSARY_ENTRY',
+            source,
+            translation,
+            targetLanguage: currentSettings.targetLanguage
+        });
+        if (!response?.ok) throw new Error(response?.error || 'Could not save glossary entry');
+        elements.glossaryEntryForm.hidden = true;
+        showToast(`Saved to glossary (${response.count} terms)`);
+    } catch (e) {
+        showToast(`Error: ${e.message}`, 'error');
     }
 }
 
@@ -1108,6 +1156,18 @@ function setupEventListeners() {
         });
     }
 
+    if (elements.addGlossaryEntryBtn) {
+        elements.addGlossaryEntryBtn.addEventListener('click', openGlossaryEntryForm);
+    }
+    if (elements.glossaryEntryForm) {
+        elements.glossaryEntryForm.addEventListener('submit', saveGlossaryEntry);
+    }
+    if (elements.cancelGlossaryEntryBtn) {
+        elements.cancelGlossaryEntryBtn.addEventListener('click', () => {
+            elements.glossaryEntryForm.hidden = true;
+        });
+    }
+
     // Refresh models
     elements.refreshModels.addEventListener('click', async () => {
         await checkProviders();
@@ -1154,6 +1214,11 @@ function setupEventListeners() {
     elements.providerSelect.addEventListener('change', async () => {
         await saveCurrentSettings();
         await checkProviders();
+        await loadModels(true);
+    });
+
+    elements.filterLlamaCppUiModels.addEventListener('change', async () => {
+        await saveCurrentSettings();
         await loadModels(true);
     });
 

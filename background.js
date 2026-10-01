@@ -19,6 +19,7 @@ const DEFAULT_SETTINGS = {
     provider: 'auto', // 'auto', 'ollama', 'lmstudio'
     ollamaUrl: 'http://localhost:11434',
     lmstudioUrl: 'http://localhost:1234',
+    filterLlamaCppUiModels: false,
     selectedModel: '',
     targetLanguage: 'en',
     sourceLanguage: 'auto', // 'auto' = detect from page, or specific code
@@ -82,6 +83,7 @@ Produce only the {{targetLang}} translation, without any additional explanations
 // Keyed by the provider setting so switching providers invalidates it.
 let cachedModels = null;
 let cachedModelsProvider = null;
+let cachedModelsFilterLlamaCppUi = null;
 let modelsCacheTime = 0;
 const MODEL_CACHE_TTL = 60000; // 60 seconds
 
@@ -168,6 +170,49 @@ function invalidateGlossary() {
     glossaryExactIndex = null;
     glossaryTargetLang = '';
     glossarySig = null;
+}
+
+// Add or replace one entry from the popup's quick-add form. Unlike importing a
+// TSV, this preserves existing entries and makes the in-extension glossary the
+// immediate source of truth. A target language is set for a new inline glossary
+// so terms are never accidentally reused for another output language.
+async function upsertGlossaryEntry(source, translation, targetLanguage) {
+    const src = typeof source === 'string' ? source.trim() : '';
+    const tgt = typeof translation === 'string' ? translation.trim() : '';
+    const language = typeof targetLanguage === 'string'
+        ? targetLanguage.split('-')[0].toLowerCase()
+        : '';
+    if (!src || !tgt) throw new Error('Source and translation are required');
+
+    const entries = await loadGlossary();
+    if (glossaryTargetLang && language && glossaryTargetLang !== language) {
+        throw new Error(`Glossary is configured for ${glossaryTargetLang}, not ${language}`);
+    }
+
+    const bySource = new Map();
+    for (const entry of entries) {
+        const existingSource = entry && typeof entry[0] === 'string' ? entry[0].trim() : '';
+        if (existingSource) bySource.set(existingSource, entry[1] || '');
+    }
+    bySource.set(src, tgt);
+
+    const stored = await browserAPI.storage.local.get(GLOSSARY_META_KEY);
+    const existingMeta = stored[GLOSSARY_META_KEY] || {};
+    const meta = {
+        name: existingMeta.name || 'Built-in glossary',
+        // Keep legacy/imported all-language glossaries all-language. A newly
+        // created inline glossary is scoped to the current output language.
+        target: glossaryTargetLang || (entries.length === 0 ? language : ''),
+        loadedAt: Date.now()
+    };
+    await browserAPI.storage.local.set({
+        [GLOSSARY_KEY]: [...bySource.entries()],
+        [GLOSSARY_META_KEY]: meta
+    });
+    invalidateGlossary();
+    // The same source can now produce a different output.
+    if (typeof cacheClear === 'function') await cacheClear();
+    return { count: bySource.size, target: meta.target };
 }
 
 // A glossary maps source terms to ONE target language. When the TSV declares it
@@ -412,7 +457,20 @@ async function listOllamaModels(url) {
     }
 }
 
-async function listLMStudioModels(url) {
+// llama.cpp router includes the rendered model preset in /v1/models. The
+// `ui` preset option is serialized as `webui`; honor it when present without
+// imposing llama.cpp-specific metadata on LM Studio or other OpenAI servers.
+function isLlamaCppModelVisible(model) {
+    const preset = model?.status?.preset;
+    if (typeof preset !== 'string') return true;
+
+    const match = preset.match(/^\s*webui\s*=\s*(\S+)\s*$/mi);
+    if (!match) return true;
+
+    return !['0', 'false', 'no', 'off'].includes(match[1].toLowerCase());
+}
+
+async function listLMStudioModels(url, filterLlamaCppUiModels = false) {
     url = normalizeServerUrl(url);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
@@ -421,7 +479,9 @@ async function listLMStudioModels(url) {
         clearTimeout(timeoutId);
         if (!response.ok) throw new Error('Failed to fetch LMStudio models');
         const data = await response.json();
-        return (data.data || []).map(m => ({ id: m.id, name: m.id, provider: 'lmstudio' }));
+        return (data.data || [])
+            .filter(model => !filterLlamaCppUiModels || isLlamaCppModelVisible(model))
+            .map(m => ({ id: m.id, name: m.id, provider: 'lmstudio' }));
     } catch (e) {
         clearTimeout(timeoutId);
         if (e.name === 'AbortError') throw new Error('LMStudio model listing timed out');
@@ -431,9 +491,11 @@ async function listLMStudioModels(url) {
 
 async function listModels(settings, useCache = true) {
     const provider = settings.provider;
+    const filterLlamaCppUiModels = !!settings.filterLlamaCppUiModels;
 
     // Return cached models if available, not expired, and for the same provider
     if (useCache && cachedModels && cachedModelsProvider === provider
+        && cachedModelsFilterLlamaCppUi === filterLlamaCppUiModels
         && (Date.now() - modelsCacheTime < MODEL_CACHE_TTL)) {
         return cachedModels;
     }
@@ -445,7 +507,7 @@ async function listModels(settings, useCache = true) {
     // provider was explicitly selected.
     const [lmstudioResult, ollamaResult] = await Promise.allSettled([
         (provider === 'lmstudio' || provider === 'auto')
-            ? listLMStudioModels(settings.lmstudioUrl) : Promise.resolve([]),
+            ? listLMStudioModels(settings.lmstudioUrl, filterLlamaCppUiModels) : Promise.resolve([]),
         (provider === 'ollama' || provider === 'auto')
             ? listOllamaModels(settings.ollamaUrl) : Promise.resolve([])
     ]);
@@ -457,6 +519,7 @@ async function listModels(settings, useCache = true) {
     // Update cache
     cachedModels = models;
     cachedModelsProvider = provider;
+    cachedModelsFilterLlamaCppUi = filterLlamaCppUiModels;
     modelsCacheTime = Date.now();
 
     return models;
@@ -1434,6 +1497,28 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                         // First rows only: enough to eyeball the dictionary without
                         // shipping tens of thousands of pairs to the options page.
                         preview: entries.slice(0, GLOSSARY_PREVIEW_MAX)
+                    });
+                    break;
+                }
+
+                case 'UPSERT_GLOSSARY_ENTRY': {
+                    const result = await upsertGlossaryEntry(
+                        message.source,
+                        message.translation,
+                        message.targetLanguage || settings.targetLanguage
+                    );
+                    sendResponse({ ok: true, ...result });
+                    break;
+                }
+
+                case 'EXPORT_GLOSSARY': {
+                    const entries = await loadGlossary();
+                    const result = await browserAPI.storage.local.get(GLOSSARY_META_KEY);
+                    const meta = result[GLOSSARY_META_KEY] || {};
+                    sendResponse({
+                        entries,
+                        target: meta.target || '',
+                        name: meta.name || 'glossary'
                     });
                     break;
                 }

@@ -9,6 +9,7 @@ const DEFAULT_SETTINGS = {
     provider: 'auto',
     ollamaUrl: 'http://localhost:11434',
     lmstudioUrl: 'http://localhost:1234',
+    filterLlamaCppUiModels: false,
     selectedModel: '',
     targetLanguage: 'en',
     sourceLanguage: 'auto',
@@ -75,6 +76,7 @@ const elements = {
     providerSelect: document.getElementById('providerSelect'),
     ollamaUrl: document.getElementById('ollamaUrl'),
     lmstudioUrl: document.getElementById('lmstudioUrl'),
+    filterLlamaCppUiModels: document.getElementById('filterLlamaCppUiModels'),
     modelSelect: document.getElementById('modelSelect'),
     refreshModels: document.getElementById('refreshModels'),
     sourceLanguage: document.getElementById('sourceLanguage'),
@@ -103,6 +105,7 @@ const elements = {
     glossaryStatus: document.getElementById('glossaryStatus'),
     glossaryPreview: document.getElementById('glossaryPreview'),
     glossaryTerms: document.getElementById('glossaryTerms'),
+    exportGlossary: document.getElementById('exportGlossary'),
     clearGlossary: document.getElementById('clearGlossary'),
     floatingButton: document.getElementById('floatingButton'),
     customPromptsSection: document.getElementById('customPromptsSection'),
@@ -303,6 +306,7 @@ function applySettingsToUI() {
     elements.providerSelect.value = currentSettings.provider;
     elements.ollamaUrl.value = currentSettings.ollamaUrl;
     elements.lmstudioUrl.value = currentSettings.lmstudioUrl;
+    elements.filterLlamaCppUiModels.checked = !!currentSettings.filterLlamaCppUiModels;
     elements.sourceLanguage.value = currentSettings.sourceLanguage || 'auto';
     elements.targetLanguage.value = currentSettings.targetLanguage;
     elements.requestFormat.value = currentSettings.requestFormat;
@@ -394,6 +398,7 @@ async function saveCurrentSettings() {
         provider: elements.providerSelect.value,
         ollamaUrl: elements.ollamaUrl.value,
         lmstudioUrl: elements.lmstudioUrl.value,
+        filterLlamaCppUiModels: elements.filterLlamaCppUiModels.checked,
         selectedModel: elements.modelSelect?.value || currentSettings.selectedModel,
         sourceLanguage: elements.sourceLanguage.value,
         targetLanguage: elements.targetLanguage.value,
@@ -501,6 +506,24 @@ async function refreshGlossaryStatus() {
     elements.glossaryPreview.hidden = false;
 }
 
+function downloadGlossaryTSV(entries, target) {
+    const lines = [];
+    if (target) lines.push(`#target: ${target}`);
+    for (const entry of entries) {
+        const source = entry && typeof entry[0] === 'string' ? entry[0] : '';
+        if (!source) continue;
+        const translation = entry[1] === undefined || entry[1] === null ? '' : String(entry[1]);
+        lines.push(`${source}\t${translation}`);
+    }
+    const blob = new Blob([`${lines.join('\n')}\n`], { type: 'text/tab-separated-values;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'glossary.tsv';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 // Show toast notification
 function showToast(message, type = 'success', duration = 3000) {
     const toast = elements.toast;
@@ -545,6 +568,15 @@ function setupEventListeners() {
         await browserAPI.runtime.sendMessage({
             type: 'SAVE_SETTINGS',
             settings: { provider: currentSettings.provider }
+        });
+        await loadModels(true);
+    });
+
+    elements.filterLlamaCppUiModels.addEventListener('change', async () => {
+        currentSettings.filterLlamaCppUiModels = elements.filterLlamaCppUiModels.checked;
+        await browserAPI.runtime.sendMessage({
+            type: 'SAVE_SETTINGS',
+            settings: { filterLlamaCppUiModels: currentSettings.filterLlamaCppUiModels }
         });
         await loadModels(true);
     });
@@ -631,6 +663,23 @@ function setupEventListeners() {
                 showToast('Failed to read file', 'error');
             } finally {
                 e.target.value = ''; // allow re-loading the same file
+            }
+        });
+    }
+
+    // Glossary: export the current in-extension dictionary as TSV.
+    if (elements.exportGlossary) {
+        elements.exportGlossary.addEventListener('click', async () => {
+            try {
+                const res = await browserAPI.runtime.sendMessage({ type: 'EXPORT_GLOSSARY' });
+                if (!res || !Array.isArray(res.entries) || !res.entries.length) {
+                    showToast('No glossary entries to export', 'error');
+                    return;
+                }
+                downloadGlossaryTSV(res.entries, res.target);
+                showToast(`Exported ${res.entries.length} glossary terms`);
+            } catch (e) {
+                showToast('Failed to export glossary', 'error');
             }
         });
     }
