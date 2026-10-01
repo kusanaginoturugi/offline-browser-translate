@@ -167,6 +167,7 @@ prompt appears in the running browser. Re-run it after changes to update.
 The extension will:
 - Extract all visible text from the page
 - Prioritize headings and visible content
+- Defer closed accordion sections until you expand them
 - Translate in batches with progress percentage
 - Auto-translate new content (infinite scroll)
 

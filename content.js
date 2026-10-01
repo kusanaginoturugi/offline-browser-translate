@@ -59,6 +59,8 @@ let showGlow = false; // Setting for glow effect (disabled by default)
 let mutationObserver = null;
 let pendingNewNodes = [];
 let autoTranslateDebounceTimer = null;
+let openedDetailsToTranslate = new Set();
+let openedDetailsTimer = null;
 
 // Translation state for toggle functionality
 let hasTranslationCache = false; // True if we have cached translations
@@ -85,7 +87,10 @@ function shouldSkipElement(element) {
     if (!element || !element.tagName) return true;
     if (element.isContentEditable) return true;
 
-    // Check element and ancestors for SKIP_TAGS, translate="no", or our extension elements
+    // Check element and ancestors for SKIP_TAGS, translate="no", or our extension elements.
+    // Closed <details> often holds long, optional sections (accordions,
+    // requirements, footnotes). Keep its <summary> visible and translatable,
+    // but defer everything else until the user opens it.
     let curr = element;
     while (curr) {
         if (curr.tagName && SKIP_TAGS.has(curr.tagName)) {
@@ -96,6 +101,10 @@ function shouldSkipElement(element) {
         }
         if (curr.id === 'llm-translator-status' || curr.id === 'llm-translator-float-btn') {
             return true;
+        }
+        if (curr.tagName === 'DETAILS' && !curr.open) {
+            const summary = element.closest('summary');
+            if (!summary || summary.parentElement !== curr) return true;
         }
         curr = curr.parentElement;
     }
@@ -211,7 +220,8 @@ function isNodeProcessed(node) {
  * Factors: viewport visibility, semantic context (main vs sidebar), parent tag type.
  */
 const TAG_PRIORITY = {
-    P: 80, H1: 70, H2: 60, H3: 50, H4: 40, H5: 40, H6: 40,
+    H1: 260, H2: 240, H3: 220, H4: 200, H5: 190, H6: 180, SUMMARY: 170,
+    P: 80,
     LI: 30, BLOCKQUOTE: 25, FIGCAPTION: 25, TD: 20, TH: 20,
     SPAN: 5, DIV: 5, A: -10, LABEL: -30, BUTTON: -50
 };
@@ -234,6 +244,14 @@ function calculatePriority(node) {
         priority += 500;
     } else if (parent.closest('nav, aside, footer, header, [role="navigation"], [role="complementary"]')) {
         priority -= 300;
+    }
+
+    // Chapter titles and accordion labels are usually the best first clue to a
+    // page's structure, even when their text sits inside a nested <span>.
+    if (parent.closest('h1, h2, h3, h4, h5, h6, [role="heading"]')) {
+        priority += 700;
+    } else if (parent.closest('summary')) {
+        priority += 600;
     }
 
     // Tag type
@@ -1061,6 +1079,49 @@ async function translatePendingNodes() {
     }
 }
 
+// A closed accordion was intentionally skipped during initial extraction. Once
+// opened, translate just that section instead of restarting the whole page.
+function queueOpenedDetails(details) {
+    if (!details || !details.open || !hasTranslationCache) return;
+    openedDetailsToTranslate.add(details);
+    if (openedDetailsTimer) clearTimeout(openedDetailsTimer);
+    openedDetailsTimer = setTimeout(translateOpenedDetails, 150);
+}
+
+async function translateOpenedDetails() {
+    openedDetailsTimer = null;
+    if (!openedDetailsToTranslate.size) return;
+    if (translationInProgress) {
+        openedDetailsTimer = setTimeout(translateOpenedDetails, 250);
+        return;
+    }
+
+    const details = [...openedDetailsToTranslate].filter(item => item.isConnected && item.open);
+    openedDetailsToTranslate.clear();
+    if (!details.length) return;
+
+    const textItems = [];
+    for (const item of details) textItems.push(...extractTextNodes(item, true));
+    if (!textItems.length) return;
+
+    translationInProgress = true;
+    showStatus(`Translating ${textItems.length} expanded elements...`);
+    try {
+        const result = await translateBatch(textItems, currentTargetLanguage);
+        showStatus(`Translated ${result.applied}/${textItems.length} expanded elements`);
+        setTimeout(hideStatus, 2000);
+    } catch (e) {
+        console.error('Expanded section translation error:', e);
+        showStatus(`Expanded section error: ${e.message}`, true);
+        setTimeout(hideStatus, 3000);
+    } finally {
+        translationInProgress = false;
+        if (openedDetailsToTranslate.size && !openedDetailsTimer) {
+            openedDetailsTimer = setTimeout(translateOpenedDetails, 0);
+        }
+    }
+}
+
 async function translateSelection(targetLanguage, sourceLanguage = 'auto', forceFresh = false) {
     if (translationInProgress) {
         showStatus('Translation already in progress...', true);
@@ -1405,6 +1466,12 @@ document.addEventListener('selectionchange', () => {
         hideFloatingBtn();
     }
 });
+
+// `toggle` is dispatched by <details> after its open state changes. Capture it
+// so this also works on sites where the event is not bubbled by a framework.
+document.addEventListener('toggle', (event) => {
+    if (event.target instanceof HTMLDetailsElement) queueOpenedDetails(event.target);
+}, true);
 
 window.addEventListener('scroll', () => {
     if (floatingTranslateBtn && floatingTranslateBtn.style.display !== 'none') hideFloatingBtn();
