@@ -19,20 +19,18 @@ const DEFAULT_SETTINGS = {
     provider: 'auto', // 'auto', 'ollama', 'lmstudio'
     ollamaUrl: 'http://localhost:11434',
     lmstudioUrl: 'http://localhost:1234',
-    filterLlamaCppUiModels: false,
     selectedModel: '',
     targetLanguage: 'en',
     sourceLanguage: 'auto', // 'auto' = detect from page, or specific code
     maxTokensPerBatch: 2000,
     maxItemsPerBatch: 8,
-    maxConcurrentRequests: 4, // 1-4 parallel requests (LMStudio 0.4.0+ supports up to 4)
-    useAdvanced: false,
-    customSystemPrompt: '',
-    customUserPromptTemplate: '',
+    maxConcurrentRequests: 4, // 1-32 parallel requests (LMStudio 0.4.0+ supports parallelism)
+    // Per-format prompt overrides: { [format]: { system, user } }. A format with
+    // no entry here falls back to its built-in PROMPT_TEMPLATES text. There's no
+    // 'auto' entry — auto resolves to a concrete format first, and that format's
+    // (possibly overridden) prompt is what's actually used.
+    customPrompts: {},
     requestFormat: 'auto', // 'auto' (detect from model), 'default', 'translategemma', 'hunyuan', 'simple', 'custom'
-    qualityFallbackModel: 'auto', // 'auto' = TranslateGemma 4B can retry failed segments on a loaded 12B model
-    qualityFallbackLongTextWords: 120,
-    qualityFallbackLongTextChars: 700,
     temperature: 0.3,
     useStructuredOutput: true,
     maxOutputRetries: 2,    // Extra attempts when the model returns malformed/missing translations
@@ -44,7 +42,13 @@ const DEFAULT_SETTINGS = {
     cacheMode: 'off',
     debug: false,       // Enable verbose logging
     floatingButton: false, // Show floating translate button on text selection (requires <all_urls> permission)
-    useGlossary: true   // Inject matching glossary terms into the prompt for consistent proper-noun translation
+    useGlossary: false,  // Off by default; when on, injects matching glossary terms into the prompt for consistent proper-noun translation
+    // Translate a page as soon as it loads when it declares a language other
+    // than the target one (requires <all_urls> permission). Off by default:
+    // every page load costs real inference time on the user's own machine.
+    autoTranslatePages: false,
+    autoTranslateNeverLanguages: [], // language codes to leave alone
+    autoTranslateNeverSites: []      // hostnames to leave alone (subdomains included)
 };
 
 let debugEnabled = false;
@@ -79,11 +83,8 @@ Produce only the {{targetLang}} translation, without any additional explanations
     }
 };
 
-// Cache for models to avoid repeated API calls during translation.
-// Keyed by the provider setting so switching providers invalidates it.
+// Cache for models to avoid repeated API calls during translation
 let cachedModels = null;
-let cachedModelsProvider = null;
-let cachedModelsFilterLlamaCppUi = null;
 let modelsCacheTime = 0;
 const MODEL_CACHE_TTL = 60000; // 60 seconds
 
@@ -119,6 +120,46 @@ async function getSettings() {
         return loadSettings();
     }
     return cachedSettings;
+}
+
+// ============================================================================
+// Content script auto-injection
+//
+// Most of the extension works by injecting content.js on demand when the user
+// asks for a translation. Two features instead need it present on every page
+// before the user does anything: the floating selection button, and
+// auto-translate. Registration is therefore keyed off the union of the two --
+// turning one off must not pull the script out from under the other.
+// ============================================================================
+
+const CONTENT_SCRIPT_ID = 'llm-translator-content';
+
+function needsContentScript(settings) {
+    return !!(settings && (settings.floatingButton || settings.autoTranslatePages));
+}
+
+async function syncContentScriptRegistration() {
+    const settings = await getSettings();
+    if (needsContentScript(settings)) {
+        try {
+            await browserAPI.scripting.registerContentScripts([{
+                id: CONTENT_SCRIPT_ID,
+                matches: ['http://*/*', 'https://*/*'],
+                js: ['content.js'],
+                runAt: 'document_idle'
+            }]);
+        } catch (e) {
+            // Already registered — not an error
+        }
+        return true;
+    }
+
+    try {
+        await browserAPI.scripting.unregisterContentScripts({ ids: [CONTENT_SCRIPT_ID] });
+    } catch (e) {
+        // Not registered — not an error
+    }
+    return false;
 }
 
 // ============================================================================
@@ -170,49 +211,6 @@ function invalidateGlossary() {
     glossaryExactIndex = null;
     glossaryTargetLang = '';
     glossarySig = null;
-}
-
-// Add or replace one entry from the popup's quick-add form. Unlike importing a
-// TSV, this preserves existing entries and makes the in-extension glossary the
-// immediate source of truth. A target language is set for a new inline glossary
-// so terms are never accidentally reused for another output language.
-async function upsertGlossaryEntry(source, translation, targetLanguage) {
-    const src = typeof source === 'string' ? source.trim() : '';
-    const tgt = typeof translation === 'string' ? translation.trim() : '';
-    const language = typeof targetLanguage === 'string'
-        ? targetLanguage.split('-')[0].toLowerCase()
-        : '';
-    if (!src || !tgt) throw new Error('Source and translation are required');
-
-    const entries = await loadGlossary();
-    if (glossaryTargetLang && language && glossaryTargetLang !== language) {
-        throw new Error(`Glossary is configured for ${glossaryTargetLang}, not ${language}`);
-    }
-
-    const bySource = new Map();
-    for (const entry of entries) {
-        const existingSource = entry && typeof entry[0] === 'string' ? entry[0].trim() : '';
-        if (existingSource) bySource.set(existingSource, entry[1] || '');
-    }
-    bySource.set(src, tgt);
-
-    const stored = await browserAPI.storage.local.get(GLOSSARY_META_KEY);
-    const existingMeta = stored[GLOSSARY_META_KEY] || {};
-    const meta = {
-        name: existingMeta.name || 'Built-in glossary',
-        // Keep legacy/imported all-language glossaries all-language. A newly
-        // created inline glossary is scoped to the current output language.
-        target: glossaryTargetLang || (entries.length === 0 ? language : ''),
-        loadedAt: Date.now()
-    };
-    await browserAPI.storage.local.set({
-        [GLOSSARY_KEY]: [...bySource.entries()],
-        [GLOSSARY_META_KEY]: meta
-    });
-    invalidateGlossary();
-    // The same source can now produce a different output.
-    if (typeof cacheClear === 'function') await cacheClear();
-    return { count: bySource.size, target: meta.target };
 }
 
 // A glossary maps source terms to ONE target language. When the TSV declares it
@@ -405,6 +403,9 @@ async function probeProvider(url, originProbeUrl) {
         }
         return { ok: response.ok, blocked: false };
     } catch (e) {
+        // Normal fetch failed — could be server not running, or CORS blocking the response.
+        // Try a no-cors fetch: it gives an opaque response (can't read status/body) but
+        // will not throw if the server is reachable, only if it is truly unreachable.
         try {
             const controller2 = new AbortController();
             const timeout2 = setTimeout(() => controller2.abort(), 2000);
@@ -457,20 +458,7 @@ async function listOllamaModels(url) {
     }
 }
 
-// llama.cpp router includes the rendered model preset in /v1/models. The
-// `ui` preset option is serialized as `webui`; honor it when present without
-// imposing llama.cpp-specific metadata on LM Studio or other OpenAI servers.
-function isLlamaCppModelVisible(model) {
-    const preset = model?.status?.preset;
-    if (typeof preset !== 'string') return true;
-
-    const match = preset.match(/^\s*webui\s*=\s*(\S+)\s*$/mi);
-    if (!match) return true;
-
-    return !['0', 'false', 'no', 'off'].includes(match[1].toLowerCase());
-}
-
-async function listLMStudioModels(url, filterLlamaCppUiModels = false) {
+async function listLMStudioModels(url) {
     url = normalizeServerUrl(url);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
@@ -479,9 +467,7 @@ async function listLMStudioModels(url, filterLlamaCppUiModels = false) {
         clearTimeout(timeoutId);
         if (!response.ok) throw new Error('Failed to fetch LMStudio models');
         const data = await response.json();
-        return (data.data || [])
-            .filter(model => !filterLlamaCppUiModels || isLlamaCppModelVisible(model))
-            .map(m => ({ id: m.id, name: m.id, provider: 'lmstudio' }));
+        return (data.data || []).map(m => ({ id: m.id, name: m.id, provider: 'lmstudio' }));
     } catch (e) {
         clearTimeout(timeoutId);
         if (e.name === 'AbortError') throw new Error('LMStudio model listing timed out');
@@ -490,24 +476,20 @@ async function listLMStudioModels(url, filterLlamaCppUiModels = false) {
 }
 
 async function listModels(settings, useCache = true) {
-    const provider = settings.provider;
-    const filterLlamaCppUiModels = !!settings.filterLlamaCppUiModels;
-
-    // Return cached models if available, not expired, and for the same provider
-    if (useCache && cachedModels && cachedModelsProvider === provider
-        && cachedModelsFilterLlamaCppUi === filterLlamaCppUiModels
-        && (Date.now() - modelsCacheTime < MODEL_CACHE_TTL)) {
+    // Return cached models if available and not expired
+    if (useCache && cachedModels && (Date.now() - modelsCacheTime < MODEL_CACHE_TTL)) {
         return cachedModels;
     }
 
     const models = [];
+    const provider = settings.provider;
 
     // Query both providers in parallel; allSettled keeps results positional so
     // LMStudio models still come first, and a failure only propagates when that
     // provider was explicitly selected.
     const [lmstudioResult, ollamaResult] = await Promise.allSettled([
         (provider === 'lmstudio' || provider === 'auto')
-            ? listLMStudioModels(settings.lmstudioUrl, filterLlamaCppUiModels) : Promise.resolve([]),
+            ? listLMStudioModels(settings.lmstudioUrl) : Promise.resolve([]),
         (provider === 'ollama' || provider === 'auto')
             ? listOllamaModels(settings.ollamaUrl) : Promise.resolve([])
     ]);
@@ -518,8 +500,6 @@ async function listModels(settings, useCache = true) {
 
     // Update cache
     cachedModels = models;
-    cachedModelsProvider = provider;
-    cachedModelsFilterLlamaCppUi = filterLlamaCppUiModels;
     modelsCacheTime = Date.now();
 
     return models;
@@ -579,8 +559,6 @@ function isSuspiciousTranslation(text) {
 
 // Extract the first balanced {...} object from a string, respecting strings and
 // escapes. More reliable than a greedy regex when the model adds prose around it.
-// JSON schema for the batched translation response. The inner shape is shared:
-// Ollama wants the bare schema in `format`, LMStudio/OpenAI want it wrapped.
 function extractJsonObject(text) {
     const start = text.indexOf('{');
     if (start === -1) return null;
@@ -605,7 +583,7 @@ function extractJsonObject(text) {
     return null; // Unbalanced (e.g. truncated) — let the caller fall back.
 }
 
-function parseTranslationResponse(response, originalItems) {
+function parseTranslationResponse(response, originalItems, finishReason) {
     const expectedCount = originalItems.length;
     let translations = [];
 
@@ -656,6 +634,7 @@ function parseTranslationResponse(response, originalItems) {
         const idsMismatch = !llmIds.some(id => ourIds.includes(id));
 
         if (llmUsedSequential || idsMismatch) {
+            // console.log('[Background] LLM used sequential IDs, remapping to original IDs');
             // Map sequential LLM IDs to our original IDs
             translations = translations.map((t, index) => ({
                 id: originalItems[index]?.id ?? t.id,
@@ -689,16 +668,59 @@ function parseTranslationResponse(response, originalItems) {
     }
     if (current) segments.push(current);
 
+    // When the server tells us it cut generation off mid-output, the last segment
+    // in the response was being written the instant that happened — it may be a
+    // half-formed sentence ("Los precios pue"), not a usable translation. Drop it
+    // so it's treated as missing and cleanly retried, instead of risking a mangled
+    // translation landing on the page. Every earlier segment finished before the
+    // cutoff and is unaffected.
+    if (finishReason === 'length' && segments.length > 0) {
+        const cut = segments.pop();
+        debugWarn(`[Background] response was cut off by the output length limit — `
+            + `discarding the in-progress last segment (id ${cut.id}) instead of trusting a possibly-truncated translation`);
+        if (segments.length === 0) {
+            // The one segment we had was the one being cut — nothing usable left.
+            // Bail out here rather than falling through to the last-resort parser
+            // below, which would re-read the same truncated raw response.
+            return [];
+        }
+    }
+
     if (segments.length > 0) {
-        for (let i = 0; i < segments.length; i++) {
-            const seg = segments[i];
+        // Every batch sends the model 0-indexed sequential labels (see requestBatch),
+        // so a clean truncation (model stops after item k of N) and a
+        // dropped-and-renumbered middle item both produce the same shape: an
+        // unbroken run 0..k-1 shorter than expected. finishReason (from the API's
+        // finish_reason/done_reason) resolves the ambiguity when it's available:
+        // 'length' means the model was cut off mid-output and whatever it emitted
+        // up to that point is exactly what it intended — safe to trust. Anything
+        // else (usually 'stop', or unknown on servers that don't report it) means
+        // the model believed it was done despite the shortfall, which is the more
+        // suspicious shape. Either way we trust the prefix and retry only the
+        // missing tail — rejecting the whole batch here previously forced every
+        // truncated response through the slow per-item fallback, which in practice
+        // was most responses. Only reject outright on unambiguous corruption: a
+        // label outside our range, or a repeated label.
+        const ids = segments.map(s => s.id);
+        const ourIds = new Set(originalItems.map(item => item.id));
+        const allOurs = ids.every(id => ourIds.has(id));
+        const unique = new Set(ids).size === ids.length;
+        if (!allOurs || !unique) {
+            debugWarn(`[Background] expected ${expectedCount} items, got labels [${ids.join(',')}]`
+                + ` - numbering unreliable, rejecting batch`);
+            return [];
+        }
+        if (ids.length < expectedCount) {
+            const reason = finishReason === 'length'
+                ? 'model hit its output length limit'
+                : `model stopped on its own (finish_reason=${finishReason || 'unknown'}) — possible mid-batch skip`;
+            debugWarn(`[Background] batch returned ${ids.length}/${expectedCount} items - ${reason}. Trusting the ${ids.length} received, retrying the rest.`);
+        }
+
+        for (const seg of segments) {
             const text = seg.text.trim();
             if (!text) continue;
-            const isOurId = originalItems.some(item => item.id === seg.id);
-            translations.push({
-                id: isOurId ? seg.id : (originalItems[i]?.id ?? seg.id),
-                text: cleanTranslationText(text)
-            });
+            translations.push({ id: seg.id, text: cleanTranslationText(text) });
         }
         return translations;
     }
@@ -744,67 +766,44 @@ async function detectModelProvider(modelId, settings) {
     return model ? model.provider : null;
 }
 
-function isTranslateGemma4B(modelId) {
-    return detectRequestFormat(modelId) === 'translategemma' && /\b4b\b/i.test(modelId || '');
-}
-
-function isTranslateGemma12B(modelId) {
-    return detectRequestFormat(modelId) === 'translategemma' && /\b12b\b/i.test(modelId || '');
-}
-
-async function resolveQualityFallbackModel(settings, primaryModelId, primaryProvider) {
-    const configured = settings.qualityFallbackModel || 'auto';
-    if (configured === 'off' || configured === primaryModelId) return null;
-
-    if (configured !== 'auto') {
-        const provider = await detectModelProvider(configured, settings);
-        return provider ? { modelId: configured, provider } : null;
+// LM Studio's native (non-OpenAI-compatible) REST API exposes per-model load
+// state ('not-loaded' | 'loading' | 'loaded'), which the OpenAI-compatible
+// /v1/models endpoint doesn't. Used to show "Loading model..." instead of a
+// progress bar that looks frozen while LM Studio JIT-loads the model on the
+// first request. Returns null if unavailable (older LM Studio, or not LM
+// Studio at all) so callers can just skip the check.
+async function getLMStudioModelState(url, modelId) {
+    const path = modelId.split('/').map(encodeURIComponent).join('/');
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    try {
+        const response = await fetch(`${normalizeServerUrl(url)}/api/v0/models/${path}`, { signal: controller.signal });
+        if (!response.ok) return null;
+        const data = await response.json();
+        return data.state || null;
+    } catch (e) {
+        return null;
+    } finally {
+        clearTimeout(timeoutId);
     }
-
-    // Conservative auto mode: only the known fast/quality TranslateGemma pair.
-    if (!isTranslateGemma4B(primaryModelId)) return null;
-
-    const models = await listModels(settings, true);
-    const candidate = models.find(m => m.provider === primaryProvider && isTranslateGemma12B(m.id))
-        || models.find(m => isTranslateGemma12B(m.id));
-    return candidate ? { modelId: candidate.id, provider: candidate.provider } : null;
-}
-
-function countWordsForRouting(text) {
-    return (String(text || '').match(/[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)*/gu) || []).length;
-}
-
-function shouldUseQualityModelFirst(text, settings) {
-    const wordLimit = Number.isFinite(settings.qualityFallbackLongTextWords)
-        ? settings.qualityFallbackLongTextWords
-        : DEFAULT_SETTINGS.qualityFallbackLongTextWords;
-    const charLimit = Number.isFinite(settings.qualityFallbackLongTextChars)
-        ? settings.qualityFallbackLongTextChars
-        : DEFAULT_SETTINGS.qualityFallbackLongTextChars;
-    const s = String(text || '').trim();
-    if (!s) return false;
-    return countWordsForRouting(s) >= wordLimit || s.length >= charLimit;
 }
 
 // PLAIN_TEXT_FORMATS comes from languages.js (shared with the UIs).
 
-// Per-tab cancel controllers. A tab gets one shared controller while it has
-// translations in flight; navigating away or closing fires it to abort the
-// tab's outstanding LLM fetches instead of letting them run to the 5min timeout.
-const tabCancelControllers = new Map();
+function throwIfCancelled(cancelSignal) {
+    if (cancelSignal?.aborted) throw new DOMException('Translation cancelled', 'AbortError');
+}
 
-// Wire an optional external cancel signal into a per-request timeout controller,
-// so the fetch aborts on whichever fires first.
 function linkCancelSignal(controller, cancelSignal) {
-    if (!cancelSignal) return;
-    if (cancelSignal.aborted) {
-        controller.abort();
-        return;
-    }
-    cancelSignal.addEventListener('abort', () => controller.abort(), { once: true });
+    if (!cancelSignal) return () => {};
+    const abort = () => controller.abort();
+    if (cancelSignal.aborted) abort();
+    else cancelSignal.addEventListener('abort', abort, { once: true });
+    return () => cancelSignal.removeEventListener('abort', abort);
 }
 
 async function callOllama(settings, modelId, systemPrompt, userPrompt, jsonOutput, cancelSignal) {
+    throwIfCancelled(cancelSignal);
     const body = {
         model: modelId,
         stream: false
@@ -824,8 +823,8 @@ async function callOllama(settings, modelId, systemPrompt, userPrompt, jsonOutpu
     if (settings.numCtx) body.options.num_ctx = settings.numCtx;
 
     const controller = new AbortController();
+    const unlinkCancel = linkCancelSignal(controller, cancelSignal);
     const timeoutId = setTimeout(() => controller.abort(), 300000);
-    linkCancelSignal(controller, cancelSignal);
     let response;
     try {
         response = await fetch(`${normalizeServerUrl(settings.ollamaUrl)}/api/generate`, {
@@ -835,11 +834,13 @@ async function callOllama(settings, modelId, systemPrompt, userPrompt, jsonOutpu
             signal: controller.signal
         });
     } catch (e) {
-        clearTimeout(timeoutId);
+        if (cancelSignal?.aborted) throw e;
         if (e.name === 'AbortError') throw new Error('Ollama request timed out after 5 minutes');
         throw e;
+    } finally {
+        clearTimeout(timeoutId);
+        unlinkCancel();
     }
-    clearTimeout(timeoutId);
 
     if (!response.ok) {
         if (response.status === 403) {
@@ -850,9 +851,14 @@ async function callOllama(settings, modelId, systemPrompt, userPrompt, jsonOutpu
     }
 
     const data = await response.json();
-    debugLog(`[Background] callOllama: response length=${data.response?.length || 0}`);
-    return data.response;
+    // done_reason tells us WHY generation stopped ('stop' = the model chose to end,
+    // 'length' = it hit num_predict/context and was cut off mid-output). Only
+    // present on newer Ollama versions; undefined on older ones.
+    debugLog(`[Background] callOllama: response length=${data.response?.length || 0} done_reason=${data.done_reason || 'unknown'}`);
+    return { content: data.response, finishReason: data.done_reason || null };
 }
+
+
 
 // JSON schema for the batched translation response. The inner shape is shared:
 // Ollama wants the bare schema in `format`, LMStudio/OpenAI want it wrapped.
@@ -875,8 +881,8 @@ const TRANSLATION_JSON_SCHEMA = {
     "required": ["translations"],
     "additionalProperties": false
 };
-
 async function callLMStudio(settings, modelId, systemPrompt, userPrompt, jsonOutput, cancelSignal) {
+    throwIfCancelled(cancelSignal);
     const messages = [];
 
     if (systemPrompt) {
@@ -903,8 +909,8 @@ async function callLMStudio(settings, modelId, systemPrompt, userPrompt, jsonOut
     }
 
     const controller = new AbortController();
+    const unlinkCancel = linkCancelSignal(controller, cancelSignal);
     const timeoutId = setTimeout(() => controller.abort(), 300000);
-    linkCancelSignal(controller, cancelSignal);
     let response;
     try {
         response = await fetch(`${normalizeServerUrl(settings.lmstudioUrl)}/v1/chat/completions`, {
@@ -914,14 +920,16 @@ async function callLMStudio(settings, modelId, systemPrompt, userPrompt, jsonOut
             signal: controller.signal
         });
     } catch (e) {
-        clearTimeout(timeoutId);
+        if (cancelSignal?.aborted) throw e;
         if (e.name === 'AbortError') throw new Error('LMStudio request timed out after 5 minutes');
         if (e instanceof TypeError) {
-            throw new Error("Failed to connect to LMStudio. The extension is being blocked by LMStudio's CORS policy or the server is offline.");
+            throw new Error('Failed to connect to LMStudio. The extension is being blocked by LMStudio\'s CORS policy or the server is offline. You need to enable CORS in LMStudio.');
         }
         throw e;
+    } finally {
+        clearTimeout(timeoutId);
+        unlinkCancel();
     }
-    clearTimeout(timeoutId);
 
     if (!response.ok) {
         const error = await response.text();
@@ -941,11 +949,18 @@ async function callLMStudio(settings, modelId, systemPrompt, userPrompt, jsonOut
     // Clean up markdown code blocks if present
     content = content.replace(/^```json\s*/, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
 
-    return content;
+    // finish_reason: 'stop' = the model chose to end on its own, 'length' = it hit
+    // max_tokens/context and was cut off mid-output. Tells us definitively whether
+    // a short batch was a token-budget truncation instead of having to guess from
+    // the label pattern alone.
+    const finishReason = data.choices[0]?.finish_reason || null;
+    debugLog(`[Background] callLMStudio: finish_reason=${finishReason || 'unknown'}`);
+    return { content, finishReason };
 }
 
-// Low-level call to whichever provider, returning the raw text response.
+// Low-level call to whichever provider, returning { content, finishReason }.
 async function callProvider(provider, settings, modelId, systemPrompt, userPrompt, jsonOutput, cancelSignal) {
+    throwIfCancelled(cancelSignal);
     if (provider === 'ollama') {
         return callOllama(settings, modelId, systemPrompt, userPrompt, jsonOutput, cancelSignal);
     }
@@ -958,8 +973,8 @@ async function callProvider(provider, settings, modelId, systemPrompt, userPromp
 async function translatePlainItem(provider, settings, modelId, text, vars, cancelSignal) {
     const systemPrompt = `You are a professional translator. Translate the user's text into ${vars.targetLang}. Output ONLY the translation, with no quotes, labels, JSON, or commentary.`;
     const userPrompt = text;
-    const raw = await callProvider(provider, settings, modelId, systemPrompt, userPrompt, false, cancelSignal);
-    return cleanTranslationText((raw || '').trim());
+    const { content } = await callProvider(provider, settings, modelId, systemPrompt, userPrompt, false, cancelSignal);
+    return cleanTranslationText((content || '').trim());
 }
 
 // Small fast non-cryptographic string hash (cyrb53). Folds the prompt shape
@@ -977,27 +992,8 @@ function hashString(str) {
     return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36);
 }
 
-// Signature of everything about the prompt shape that affects model output for
-// a given settings+model pair. Shared by translate() and the cache-entry
-// deletion handler so both derive identical cache keys.
-function promptSigFor(settings, modelId, glossarySig = '') {
-    const format = resolveRequestFormat(settings, modelId);
-    const isPlainText = PLAIN_TEXT_FORMATS.has(format);
-    const template = PROMPT_TEMPLATES[format] || PROMPT_TEMPLATES.default;
-    let systemTemplate = template.system;
-    let userTemplate = template.user;
-    if (settings.useAdvanced) {
-        if (settings.customSystemPrompt) systemTemplate = settings.customSystemPrompt;
-        if (settings.customUserPromptTemplate) userTemplate = settings.customUserPromptTemplate;
-    }
-    const wantJson = !!settings.useStructuredOutput && !isPlainText;
-    return hashString([
-        format, wantJson ? 'json' : 'plain', String(settings.temperature),
-        systemTemplate, userTemplate, glossarySig
-    ].join('\u0000'));
-}
-
 async function translate(textItems, targetLanguage, settings, cancelSignal) {
+    throwIfCancelled(cancelSignal);
     const modelId = settings.selectedModel;
     if (!modelId) throw new Error('No model selected');
 
@@ -1008,32 +1004,18 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
         if (!provider) throw new Error('Could not detect model provider');
     }
 
-    const makeModelContext = (ctxModelId, ctxProvider) => {
-        // Resolve the effective request format ('auto' -> derived from the model).
-        const format = resolveRequestFormat(settings, ctxModelId);
-        const isPlainText = PLAIN_TEXT_FORMATS.has(format);
-        const template = PROMPT_TEMPLATES[format] || PROMPT_TEMPLATES.default;
+    // Resolve the effective request format ('auto' -> derived from the model).
+    const format = resolveRequestFormat(settings, modelId);
+    const isPlainText = PLAIN_TEXT_FORMATS.has(format);
+    const template = PROMPT_TEMPLATES[format] || PROMPT_TEMPLATES.default;
 
-        // Use custom prompts if advanced mode is enabled.
-        let systemTemplate = template.system;
-        let userTemplate = template.user;
-        if (settings.useAdvanced) {
-            if (settings.customSystemPrompt) systemTemplate = settings.customSystemPrompt;
-            if (settings.customUserPromptTemplate) userTemplate = settings.customUserPromptTemplate;
-        }
-
-        return {
-            modelId: ctxModelId,
-            provider: ctxProvider,
-            format,
-            isPlainText,
-            systemTemplate,
-            userTemplate,
-            wantJson: !!settings.useStructuredOutput && !isPlainText
-        };
-    };
-
-    const primaryCtx = makeModelContext(modelId, provider);
+    // A per-format override (edited and saved on the options page) wins over the
+    // built-in template for that format. This applies whether the format was
+    // picked explicitly or reached via 'auto' detection — the override is keyed
+    // by the resolved format either way.
+    const override = settings.customPrompts && settings.customPrompts[format];
+    const systemTemplate = (override && override.system) || template.system;
+    const userTemplate = (override && override.user) || template.user;
 
     // Template variables shared across attempts
     const targetLangName = getLanguageName(targetLanguage);
@@ -1048,30 +1030,33 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
         targetCode: targetLanguage.toUpperCase()
     };
 
+    // Whether to request schema-constrained JSON for this (structured) format.
+    const wantJson = !!settings.useStructuredOutput && !isPlainText;
+
     // Run one batched request for the given subset of items, returning a Map of
     // id -> good translation text (suspicious/empty results are dropped).
-    const requestBatch = async (ctx, items) => {
+    const requestBatch = async (items) => {
         // Map items to 0-indexed sequential IDs for the prompt to avoid confusing the LLM
         const mappedItems = items.map((item, index) => ({ id: index, text: item.text, originalId: item.id }));
         
         const vars = { ...baseVars, texts: formatTextsForPrompt(mappedItems) };
-        let userPrompt = buildPrompt(ctx.userTemplate, vars);
-        const systemPrompt = buildPrompt(ctx.systemTemplate, vars);
+        let userPrompt = buildPrompt(userTemplate, vars);
+        const systemPrompt = buildPrompt(systemTemplate, vars);
 
         // Prepend matching glossary terms so the model keeps proper nouns
         // consistent. Empty when the glossary is off/unmatched (prompt unchanged).
         // Skipped for plain-text formats (TranslateGemma, Hunyuan-MT): those
         // models expect a fixed prompt shape and would treat an extra instruction
         // block as text to translate. Whole-segment mappings still apply to them.
-        if (!ctx.isPlainText) {
+        if (!isPlainText) {
             const glossaryBlock = await buildGlossaryBlock(settings, mappedItems.map(m => m.text).join('\n'), targetLanguage);
             if (glossaryBlock) userPrompt = `${glossaryBlock}\n\n${userPrompt}`;
         }
-        const raw = await callProvider(ctx.provider, settings, ctx.modelId, systemPrompt, userPrompt, ctx.wantJson, cancelSignal);
+        const { content: raw, finishReason } = await callProvider(provider, settings, modelId, systemPrompt, userPrompt, wantJson, cancelSignal);
         debugLog(`[Background] Raw LLM response (first 300 chars):`, (raw || '').substring(0, 300));
-        
+
         // Parse using the mapped items so it expects 0, 1, 2...
-        const parsed = parseTranslationResponse(raw, mappedItems);
+        const parsed = parseTranslationResponse(raw, mappedItems, finishReason);
         const good = new Map();
         for (const t of parsed) {
             if (t && t.text && !t.error && !isSuspiciousTranslation(t.text)) {
@@ -1085,8 +1070,17 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
         return good;
     };
 
+    // Translate one item on its own, using the format's own template with a single
+    // unmarked segment — the shape these models were trained on. There is no batch
+    // structure to parse, so the result cannot land on the wrong item.
+    const requestOne = async (text) => {
+        const vars = { ...baseVars, texts: text };
+        const { content } = await callProvider(provider, settings, modelId,
+            buildPrompt(systemTemplate, vars), buildPrompt(userTemplate, vars), false, cancelSignal);
+        return cleanTranslationText((content || '').trim());
+    };
+
     const results = new Map();          // originalId -> final translated text
-    const resultSources = new Map();    // originalId -> 'primary' | 'fallback'
 
     // ---- Cache + de-duplication --------------------------------------------
     // Group items by a key capturing everything that determines the model output
@@ -1098,7 +1092,11 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
     // text, which still de-dups within the request. cacheKey/cache* come from cache.js.
     const cacheEnabled = settings.cacheMode !== 'off'
         && typeof cacheGetMany === 'function' && typeof cacheKey === 'function';
-    const promptSig = promptSigFor(settings, modelId, await getGlossarySignature(settings, targetLanguage));
+    const promptSig = hashString([
+        format, wantJson ? 'json' : 'plain', String(settings.temperature),
+        systemTemplate, userTemplate,
+        await getGlossarySignature(settings, targetLanguage)
+    ].join('\u0000'));
     const keyFor = cacheEnabled
         ? (text) => cacheKey(modelId, sourceLangCode, targetLanguage, promptSig, text)
         : (text) => text;
@@ -1165,86 +1163,52 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
     // Attempt the batched request, retrying only the items that came back
     // missing or malformed. maxOutputRetries extra attempts after the first.
     const maxRetries = Number.isInteger(settings.maxOutputRetries) ? settings.maxOutputRetries : 2;
-    debugLog(`[Background] translate: provider=${provider} model=${modelId} format=${primaryCtx.format} items=${textItems.length} json=${primaryCtx.wantJson}`);
-
-    const runAttempts = async (ctx, items, source, retries) => {
-        let stillPending = items;
-        for (let attempt = 0; attempt <= retries && stillPending.length > 0; attempt++) {
-            let good;
-            try {
-                good = await requestBatch(ctx, stillPending);
-            } catch (e) {
-                if (attempt === retries) throw e; // bubble transport errors on last try
-                debugWarn(`[Background] ${source} batch attempt ${attempt + 1} threw:`, e.message);
-                continue;
-            }
-            for (const item of stillPending) {
-                const text = good.get(item.id);
-                if (text !== undefined) {
-                    results.set(item.id, text);
-                    resultSources.set(item.id, source);
-                }
-            }
-            stillPending = stillPending.filter(item => !results.has(item.id));
-            if (stillPending.length) {
-                debugWarn(`[Background] ${stillPending.length} item(s) malformed/missing after ${source} attempt ${attempt + 1}`);
-            }
-        }
-        return stillPending;
-    };
-
-    let fallback = null;
-    let fallbackCtx = null;
-    if (pending.length > 0) {
-        fallback = await resolveQualityFallbackModel(settings, modelId, provider);
-        if (fallback) fallbackCtx = makeModelContext(fallback.modelId, fallback.provider);
-    }
-
-    try {
-        if (fallbackCtx) {
-            const primaryItems = [];
-            const qualityFirstItems = [];
-            for (const item of pending) {
-                if (shouldUseQualityModelFirst(item.text, settings)) qualityFirstItems.push(item);
-                else primaryItems.push(item);
-            }
-
-            if (qualityFirstItems.length) {
-                debugWarn(`[Background] Routing ${qualityFirstItems.length} long item(s) directly to quality fallback model=${fallback.modelId}`);
-                const stillLongPending = await runAttempts(fallbackCtx, qualityFirstItems, 'fallback', maxRetries);
-                pending = primaryItems.concat(stillLongPending);
-            } else {
-                pending = primaryItems;
-            }
-        }
-
-        pending = await runAttempts(primaryCtx, pending, 'primary', maxRetries);
-    } catch (e) {
-        throw e;
-    }
-
-    if (pending.length > 0 && fallbackCtx) {
-        debugWarn(`[Background] Retrying ${pending.length} item(s) with quality fallback model=${fallback.modelId} provider=${fallback.provider}`);
+    debugLog(`[Background] translate: provider=${provider} model=${modelId} format=${format} items=${textItems.length} json=${wantJson}`);
+    for (let attempt = 0; attempt <= maxRetries && pending.length > 0; attempt++) {
+        throwIfCancelled(cancelSignal);
+        let good;
         try {
-            pending = await runAttempts(fallbackCtx, pending, 'fallback', maxRetries);
+            good = await requestBatch(pending);
         } catch (e) {
-            debugWarn(`[Background] quality fallback failed:`, e.message);
+            throwIfCancelled(cancelSignal);
+            if (attempt === maxRetries) throw e; // bubble transport errors on last try
+            debugWarn(`[Background] batch attempt ${attempt + 1} threw:`, e.message);
+            continue;
+        }
+        for (const item of pending) {
+            const text = good.get(item.id);
+            if (text !== undefined) results.set(item.id, text);
+        }
+        pending = pending.filter(item => !results.has(item.id));
+        if (pending.length) {
+            debugWarn(`[Background] ${pending.length} item(s) malformed/missing after attempt ${attempt + 1}`);
+        }
+        // Nothing usable at all from a multi-item batch means the response could not
+        // be aligned. Re-sending identical input to a near-deterministic model just
+        // reproduces the same failure, so skip the remaining retries and let the
+        // per-item fallback below resolve it.
+        if (good.size === 0 && pending.length > 1) {
+            debugWarn(`[Background] batch unusable - skipping remaining retries`);
+            break;
         }
     }
 
-    // Plain-text fallback: translate the still-failing items one-by-one with no
-    // structure to parse. Only for JSON-style formats (plain formats already are).
-    if (pending.length > 0 && !primaryCtx.isPlainText && settings.plainTextFallback !== false) {
-        debugWarn(`[Background] Falling back to plain-text translation for ${pending.length} item(s)`);
+    // Per-item fallback: translate the still-failing items one at a time, with no
+    // batch structure to parse. Plain-text formats need this too — they carry the
+    // same [id]: markers in a batched prompt, and a dropped segment shifts the rest.
+    if (pending.length > 0 && settings.plainTextFallback !== false) {
+        throwIfCancelled(cancelSignal);
+        debugWarn(`[Background] Falling back to per-item translation for ${pending.length} item(s)`);
         for (const item of pending) {
+            throwIfCancelled(cancelSignal);
             try {
-                const text = await translatePlainItem(provider, settings, modelId, item.text, baseVars, cancelSignal);
-                if (text && !isSuspiciousTranslation(text)) {
-                    results.set(item.id, text);
-                    resultSources.set(item.id, 'primary');
-                }
+                const text = isPlainText
+                    ? await requestOne(item.text)
+                    : await translatePlainItem(provider, settings, modelId, item.text, baseVars, cancelSignal);
+                if (text && !isSuspiciousTranslation(text)) results.set(item.id, text);
             } catch (e) {
-                debugWarn(`[Background] plain-text fallback failed for id ${item.id}:`, e.message);
+                throwIfCancelled(cancelSignal);
+                debugWarn(`[Background] per-item fallback failed for id ${item.id}:`, e.message);
             }
         }
     }
@@ -1254,9 +1218,7 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
     if (cacheEnabled) {
         const entries = [];
         for (const g of missGroups) {
-            if (results.has(g.item.id) && resultSources.get(g.item.id) !== 'fallback') {
-                entries.push([g.key, results.get(g.item.id)]);
-            }
+            if (results.has(g.item.id)) entries.push([g.key, results.get(g.item.id)]);
         }
         if (entries.length) {
             try { await cacheSetMany(entries); }
@@ -1283,8 +1245,30 @@ async function translate(textItems, targetLanguage, settings, cancelSignal) {
 // Message Handler
 // ============================================================================
 
+const tabCancelControllers = new Map();
+
 browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // console.log('[Background] Received message:', message.type);
+    const tabId = sender.tab?.id;
+    if (message.type === 'CANCEL_TRANSLATION') {
+        const entry = tabCancelControllers.get(tabId);
+        if (entry) {
+            entry.controller.abort();
+            tabCancelControllers.delete(tabId);
+        }
+        sendResponse({ cancelled: true });
+        return false;
+    }
+
+    let entry;
+    if (message.type === 'TRANSLATE' && tabId !== undefined) {
+        entry = tabCancelControllers.get(tabId);
+        if (!entry) {
+            entry = { controller: new AbortController(), refs: 0 };
+            tabCancelControllers.set(tabId, entry);
+        }
+        entry.refs++;
+    }
 
     (async () => {
         try {
@@ -1315,54 +1299,56 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     sendResponse({ models });
                     break;
 
-                case 'REGISTER_CONTENT_SCRIPT':
-                    try {
-                        await browserAPI.scripting.registerContentScripts([{
-                            id: 'llm-translator-content',
-                            matches: ['http://*/*', 'https://*/*'],
-                            js: ['content.js'],
-                            runAt: 'document_idle'
-                        }]);
-                    } catch (e) {
-                        // Already registered — not an error
-                    }
-                    sendResponse({ ok: true });
-                    break;
-
-                case 'UNREGISTER_CONTENT_SCRIPT':
-                    try {
-                        await browserAPI.scripting.unregisterContentScripts({ ids: ['llm-translator-content'] });
-                    } catch (e) {
-                        // Not registered — not an error
-                    }
-                    sendResponse({ ok: true });
-                    break;
-
-                case 'CLEAR_TRANSLATION_CACHE_ENTRIES': {
-                    // Drop the cached translations for specific source texts (used when
-                    // the user discards/retranslates a selection). Keys are rebuilt the
-                    // same way translate() builds them, promptSig included.
-                    const modelId = settings.selectedModel;
-                    const targetLang = message.targetLanguage || settings.targetLanguage;
-                    const texts = Array.isArray(message.texts) ? message.texts : [];
-                    if (!modelId || !targetLang || texts.length === 0) {
-                        sendResponse({ ok: true, removed: 0 });
-                        break;
-                    }
-                    const srcRaw = message.sourceLanguage || settings.sourceLanguage;
-                    const source = srcRaw && srcRaw !== 'auto' ? srcRaw : 'en';
-                    const sig = promptSigFor(settings, modelId, await getGlossarySignature(settings, targetLang));
-                    const keys = texts.map(t => cacheKey(modelId, source, targetLang, sig, t));
-                    try {
-                        const removed = await cacheDeleteKeys(keys);
-                        sendResponse({ ok: true, removed });
-                    } catch (e) {
-                        sendResponse({ ok: false, error: e && e.message });
-                    }
+                case 'SYNC_CONTENT_SCRIPT': {
+                    // Register or unregister based on the *current* settings, so
+                    // callers only have to save their setting and ask for a sync.
+                    const registered = await syncContentScriptRegistration();
+                    sendResponse({ ok: true, registered });
                     break;
                 }
 
-                case 'TRANSLATE': {
+                case 'ADD_AUTO_TRANSLATE_NEVER_SITE': {
+                    // Sent from the on-page widget's "Ignore site" button.
+                    const host = typeof message.hostname === 'string' ? message.hostname.trim().toLowerCase() : '';
+                    if (!host) {
+                        sendResponse({ ok: false });
+                        break;
+                    }
+                    const current = await getSettings();
+                    const sites = Array.isArray(current.autoTranslateNeverSites)
+                        ? [...current.autoTranslateNeverSites]
+                        : [];
+                    if (!sites.includes(host)) sites.push(host);
+                    await saveSettings({ autoTranslateNeverSites: sites });
+                    sendResponse({ ok: true, sites });
+                    break;
+                }
+
+                case 'REMOVE_AUTO_TRANSLATE_NEVER_SITE': {
+                    // Sent from the popup's "Un-ignore it" link.
+                    const host = typeof message.hostname === 'string' ? message.hostname.trim().toLowerCase() : '';
+                    if (!host) {
+                        sendResponse({ ok: false });
+                        break;
+                    }
+                    const current = await getSettings();
+                    const sites = (Array.isArray(current.autoTranslateNeverSites) ? current.autoTranslateNeverSites : [])
+                        .filter(s => s !== host);
+                    await saveSettings({ autoTranslateNeverSites: sites });
+                    sendResponse({ ok: true, sites });
+                    break;
+                }
+
+                case 'GET_MODEL_STATE': {
+                    if (!settings.selectedModel) { sendResponse({ state: null }); break; }
+                    const provider = await detectModelProvider(settings.selectedModel, settings);
+                    if (provider !== 'lmstudio') { sendResponse({ state: null }); break; }
+                    const state = await getLMStudioModelState(settings.lmstudioUrl, settings.selectedModel);
+                    sendResponse({ state });
+                    break;
+                }
+
+                case 'TRANSLATE':
                     // Pass sourceLanguage for TranslateGemma support
                     let settingsWithSource = {
                         ...settings,
@@ -1386,43 +1372,19 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                         };
                     }
 
-                    // Share one cancel controller per tab so a single CANCEL (sent
-                    // when the page navigates away) aborts all its in-flight batches.
-                    // Refcount so we only drop the entry once the last batch settles.
-                    const tabId = sender.tab?.id;
-                    let entry;
-                    if (tabId !== undefined) {
-                        entry = tabCancelControllers.get(tabId);
-                        if (!entry) {
-                            entry = { controller: new AbortController(), refs: 0 };
-                            tabCancelControllers.set(tabId, entry);
-                        }
-                        entry.refs++;
-                    }
-
-                    try {
-                        const result = await translate(
-                            message.texts,
-                            message.targetLanguage,
-                            settingsWithSource,
-                            entry?.controller.signal
-                        );
-                        sendResponse({
-                            translations: result.translations,
-                            fromCache: result.fromCache,
-                            total: result.total,
-                            cacheActive: result.cacheActive
-                        });
-                    } finally {
-                        if (entry) {
-                            entry.refs--;
-                            if (entry.refs <= 0 && tabCancelControllers.get(tabId) === entry) {
-                                tabCancelControllers.delete(tabId);
-                            }
-                        }
-                    }
+                    const result = await translate(
+                        message.texts,
+                        message.targetLanguage,
+                        settingsWithSource,
+                        entry?.controller.signal
+                    );
+                    sendResponse({
+                        translations: result.translations,
+                        fromCache: result.fromCache,
+                        total: result.total,
+                        cacheActive: result.cacheActive
+                    });
                     break;
-                }
 
                 case 'CLEAR_CACHE':
                     try {
@@ -1448,21 +1410,6 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                         sendResponse({ persistent: false, error: e && e.message });
                     }
                     break;
-
-                case 'CANCEL_TRANSLATION': {
-                    // Page is navigating away / unloading — abort this tab's
-                    // outstanding LLM fetches instead of letting them run to timeout.
-                    const tabId = sender.tab?.id;
-                    if (tabId !== undefined) {
-                        const entry = tabCancelControllers.get(tabId);
-                        if (entry) {
-                            entry.controller.abort();
-                            tabCancelControllers.delete(tabId);
-                        }
-                    }
-                    sendResponse({ ok: true });
-                    break;
-                }
 
                 case 'SAVE_GLOSSARY': {
                     // entries: Array<[source, target]> already parsed by the options page.
@@ -1501,24 +1448,21 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     break;
                 }
 
-                case 'UPSERT_GLOSSARY_ENTRY': {
-                    const result = await upsertGlossaryEntry(
-                        message.source,
-                        message.translation,
-                        message.targetLanguage || settings.targetLanguage
-                    );
-                    sendResponse({ ok: true, ...result });
-                    break;
-                }
-
-                case 'EXPORT_GLOSSARY': {
+                case 'GET_GLOSSARY_ENTRIES': {
+                    // Full dictionary, for the inline editor. GET_GLOSSARY_INFO's
+                    // preview is truncated and must never be used as the editor's
+                    // working copy — saving it back would drop every term past
+                    // GLOSSARY_PREVIEW_MAX.
                     const entries = await loadGlossary();
-                    const result = await browserAPI.storage.local.get(GLOSSARY_META_KEY);
-                    const meta = result[GLOSSARY_META_KEY] || {};
+                    let meta = null;
+                    try {
+                        const result = await browserAPI.storage.local.get(GLOSSARY_META_KEY);
+                        meta = result[GLOSSARY_META_KEY] || null;
+                    } catch (e) { /* meta is cosmetic */ }
                     sendResponse({
                         entries,
-                        target: meta.target || '',
-                        name: meta.name || 'glossary'
+                        name: meta && meta.name || '',
+                        target: meta && meta.target || ''
                     });
                     break;
                 }
@@ -1534,8 +1478,19 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     sendResponse({ error: 'Unknown message type' });
             }
         } catch (e) {
-            console.error('[Background] Error:', e);
-            sendResponse({ error: e.message });
+            if (e.name === 'AbortError') {
+                sendResponse({ cancelled: true });
+            } else {
+                console.error('[Background] Error:', e);
+                sendResponse({ error: e.message });
+            }
+        } finally {
+            if (entry) {
+                entry.refs--;
+                if (entry.refs === 0 && tabCancelControllers.get(tabId) === entry) {
+                    tabCancelControllers.delete(tabId);
+                }
+            }
         }
     })();
 
@@ -1577,21 +1532,9 @@ browserAPI.runtime.onInstalled.addListener(async () => {
     // Auto-detect and select a model on fresh install (when none is configured yet)
     await autoDetectAndSelectModel();
 
-    // Re-register content script auto-injection if the user had the floating button enabled.
+    // Re-register content script auto-injection if a feature still needs it.
     // registerContentScripts() registrations are cleared on extension update/reinstall.
-    const settings = await getSettings();
-    if (settings.floatingButton) {
-        try {
-            await browserAPI.scripting.registerContentScripts([{
-                id: 'llm-translator-content',
-                matches: ['http://*/*', 'https://*/*'],
-                js: ['content.js'],
-                runAt: 'document_idle'
-            }]);
-        } catch (e) {
-            // Already registered (e.g. fresh install where registration survived)
-        }
-    }
+    await syncContentScriptRegistration();
 });
 
 browserAPI.contextMenus.onClicked.addListener(async (info, tab) => {

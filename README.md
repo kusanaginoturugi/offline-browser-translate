@@ -2,7 +2,9 @@
   <img src="assets/logo.png" width="48" valign="middle"> Local LLM Translator
 </h1>
 
-A privacy-focused browser extension that translates web pages using local LLMs (Ollama, LMStudio, or llama.cpp). **Your data never leaves your machine.**
+Fork maintenance notes: [upstream 1.7.0 sync](docs/fork-sync-2026-10-20.md).
+
+A privacy-focused browser extension that translates web pages using local LLMs (Ollama or LMStudio). **Your data never leaves your machine.**
 
 [![Get the Add-on](https://extensionworkshop.com/assets/img/documentation/publish/get-the-addon-178x60px.dad84b42.png)](https://addons.mozilla.org/en-GB/firefox/addon/local-llm-translator/)
 
@@ -12,8 +14,8 @@ A privacy-focused browser extension that translates web pages using local LLMs (
 - 🎯 **Smart Prioritization** - Visible content and headings are translated first
 - 🌍 **Many Languages** - Supports many many languages :3
 - ⚡ **Translation Cache** - Optional: translate identical text once and reuse it (great for forums). Off by default; stored locally with a session-only or persistent mode
-- 🛠️ **Selection Repair** - Retranslate a bad selected segment or discard its cached translation and restore the original text
-- 📖 **Glossary** - Force consistent translations for proper nouns and UI labels via a user-supplied TSV dictionary
+- 📖 **Glossary** - Force consistent translations for proper nouns and UI labels via a user-supplied dictionary
+- 🚀 **Auto-Translate** - Optional: translate foreign-language pages the moment they load, with per-language and per-site exclusions
 
 ## Requirements
 
@@ -25,123 +27,12 @@ You need one of these running locally:
 
 With a translation-capable model loaded (e.g. `TranslateGemma`, `tencent.hunyuan-mt`, `qwen3`, etc.)
 
-### llama.cpp setup
-
-`llama-server` exposes an OpenAI-compatible API, which this extension uses
-directly — enter `http://localhost:8080` in the **LMStudio / OpenAI-compatible
-URL** field:
-
-```sh
-llama-server \
-  -m /path/to/model.gguf \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --n-gpu-layers 999
-```
-
-For GPU acceleration, use a CUDA/ROCm/Vulkan-enabled `llama.cpp` build.
-
-If the Firefox background console shows a CORS error for
-`http://127.0.0.1:8080/v1/models`, allow the extension origin explicitly:
-
-```sh
-llama-server \
-  -m /path/to/model.gguf \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --n-gpu-layers 999 \
-  --cors-origins "moz-extension://<extension-uuid>"
-```
-
-Find the origin in the background debugger. For a script URL such as
-`moz-extension://ca462efa-9eb3-47a8-b32e-c8f6d7b859c9/languages.js`, use only
-the origin part:
-
-```sh
---cors-origins "moz-extension://ca462efa-9eb3-47a8-b32e-c8f6d7b859c9"
-```
-
-Avoid `--cors-origins "*"` unless the server is tightly isolated. Also avoid
-mixing `localhost` and the extension origin if Firefox reports that
-`Access-Control-Allow-Origin` does not match; some `llama-server` builds return
-the comma-separated value literally, but browsers require a single matching
-origin in that response header. The built-in `llama-server` Web UI does not
-need CORS for direct browser access to `http://127.0.0.1:8080`.
-
-If both TranslateGemma 4B and 12B are loaded, select the 4B model for normal
-use. The extension keeps short segments on 4B first; when a segment still comes
-back empty, malformed, or suspicious after retries, it can automatically retry
-just that failed segment on the loaded 12B model. Long segments (120+ words or
-700+ characters) are sent directly to 12B. It does not send every segment to
-both models.
-
-**TranslateGemma note:** the model's bundled chat template requires a special
-structured input and makes `llama-server` reject plain OpenAI-style messages
-(startup fails with a Jinja exception). Override it with a plain Gemma
-template — the extension builds the full TranslateGemma prompt itself. Save
-this as `gemma.jinja`:
-
-```jinja
-{{ bos_token }}{%- for message in messages -%}
-    {%- if message['role'] == 'assistant' -%}
-        {{ '<start_of_turn>model\n' + (message['content'] | trim) + '<end_of_turn>\n' }}
-    {%- else -%}
-        {{ '<start_of_turn>user\n' + (message['content'] | trim) + '<end_of_turn>\n' }}
-    {%- endif -%}
-{%- endfor -%}
-{%- if add_generation_prompt -%}
-    {{ '<start_of_turn>model\n' }}
-{%- endif -%}
-```
-
-and start the server with it:
-
-```sh
-llama-server -hf mradermacher/translategemma-4b-it-GGUF:Q4_K_M \
-  --host 127.0.0.1 --port 8080 -ngl 999 \
-  --jinja --chat-template-file gemma.jinja
-```
-
-(`--no-jinja --chat-template gemma` also works for translation, but it
-disables tool calls, which breaks llama-server's built-in web UI. Passing a
-built-in template *name* while Jinja is enabled does not work — the name is
-treated as a literal template string.)
-
-### Remote servers and gateways
-
-The LMStudio path speaks the plain OpenAI-compatible API
-(`GET /v1/models`, `POST /v1/chat/completions`), so it also works with any
-endpoint that exposes it: `llama-server` on another machine, vLLM, or an AI
-gateway such as [Tailscale Aperture](https://tailscale.com/docs/aperture) —
-useful for translating on a machine without a GPU by borrowing one over your
-tailnet.
-
-Point the **LMStudio / OpenAI-compatible URL** at the remote endpoint (e.g.
-`http://myserver.my-tailnet.ts.net`). For non-localhost URLs the extension
-asks for host permission for that origin when you hit Save — an explicit
-opt-in, since the extension ships with localhost-only permissions.
-
 ## Installation
 
 ### Firefox / Mullvad Browser
 1. Go to `about:debugging#/runtime/this-firefox`
 2. Click **Load Temporary Add-on**
 3. Select the `manifest.json` file
-
-This is temporary and is removed on restart. For a persistent install, package it
-as an `.xpi` and load it in a browser that allows unsigned add-ons (Firefox
-Developer Edition / Nightly / ESR with `xpinstall.signatures.required = false`):
-
-1. Run `./mkxpi.sh` to produce `local-llm-translator-<version>.xpi`
-2. Go to `about:addons` → gear icon → **Install Add-on From File**
-3. Select the generated `.xpi`
-
-An xpi is just a zip with `manifest.json` at the root, so no signing or `web-ext`
-is needed. Bump `version` in `manifest.json` and re-run `./mkxpi.sh` to update.
-
-`./mkxpi.sh --install` builds and then opens the xpi in
-`firefox-developer-edition` (override with `FIREFOX=...`), so the install
-prompt appears in the running browser. Re-run it after changes to update.
 
 ### Chrome / Chromium
 1. Go to `chrome://extensions`
@@ -167,179 +58,8 @@ prompt appears in the running browser. Re-run it after changes to update.
 The extension will:
 - Extract all visible text from the page
 - Prioritize headings and visible content
-- Defer closed accordion sections until you expand them
 - Translate in batches with progress percentage
 - Auto-translate new content (infinite scroll)
-
-### Fixing a Bad Translation
-
-If a small part of the page is translated badly:
-
-1. Select the bad translated text on the page
-2. Open the extension popup
-3. Click **Retranslate Selection** to force a fresh translation
-4. Click **Discard Selection** to restore the original text and forget that cached translation
-
-Selection actions work on the extension's internal sentence/text segments. Long text is usually handled sentence by sentence; short UI text may be restored or retranslated as one text-node segment.
-
-## Benchmarking
-
-Use `scripts/benchmark.rb` to measure local LLM translation speed with a fixed
-8-segment input set. This measures provider/API translation throughput, not
-browser DOM replacement time.
-
-```sh
-PROVIDER=ollama MODEL=translategemma:4b TARGET_LANGUAGE=Japanese ./scripts/benchmark.rb
-PROVIDER=llamacpp TARGET_LANGUAGE=Japanese ./scripts/benchmark.rb
-```
-
-Recommended reporting:
-
-- Use one warmup run and at least three measured runs (the script default)
-- Record the model, provider, target language, wall time, source characters/sec,
-  and output tokens/sec
-- Keep the benchmark input unchanged when comparing models or machines
-
-### Local Reference
-
-Measured on 2026-07-08, English -> Japanese, 8 segments / 584 source
-characters, Q4_K_M quantization on both providers. These are reference numbers
-for this machine, not a guarantee for other pages; real page translation also
-depends on DOM size, cache hits, and parallel request settings.
-
-Machine:
-
-- OS: `Linux 7.1.2-zen1-1.1-zen x86_64 GNU/Linux`
-- CPU: AMD Ryzen 7 3700X 8-Core Processor / 16 threads
-- RAM: 31.3 GiB
-- GPU: NVIDIA GeForce RTX 3060, 12 GiB VRAM, driver 610.43.02
-- Ollama with its library `translategemma` models; llama.cpp b9902 (CUDA) with
-  `mradermacher/translategemma-{4b,12b}-it-GGUF:Q4_K_M`, all layers on GPU
-
-| Model | Provider | Avg wall time | Source chars/s | Avg output tokens/s |
-|-------|----------|---------------|----------------|---------------------|
-| TranslateGemma 4B | `llamacpp` | 3.18 s | 190.4 | 94.8 |
-| TranslateGemma 4B | `ollama` | 5.04 s | 116.0 | 76.1 |
-| TranslateGemma 12B | `llamacpp` | 6.68 s | 87.4 | 36.4 |
-| TranslateGemma 12B | `ollama` | 7.27 s | 80.3 | 35.1 |
-
-### Long-text Routing Reference
-
-Measured on 2026-07-16, English -> Japanese, using text adapted from the
-Wikipedia "Secure Shell" article: 3 segments / 1,916 source characters. The
-segments were 28 words, 72 words, and 180 words; only the 180-word segment
-crossed the long-text threshold and was routed to 12B.
-
-llama.cpp was run with both TranslateGemma Q4_K_M models fully offloaded to the
-GPU by reducing context and server parallelism:
-
-```ini
-[translategemma-4b-translate]
-model = /home/onoue/.local/lib/models/translategemma-4b-it.Q4_K_M.gguf
-chat-template-file = /home/onoue/.local/lib/models/gemma.jinja
-c = 4096
-parallel = 1
-n-gpu-layers = 99
-
-[translategemma-12b-translate]
-model = /home/onoue/.local/lib/models/translategemma-12b-it.Q4_K_M.gguf
-chat-template-file = /home/onoue/.local/lib/models/gemma.jinja
-c = 4096
-parallel = 1
-n-gpu-layers = 99
-```
-
-| Pattern | Avg wall time | Source chars/s | Routing |
-|---------|---------------|----------------|---------|
-| TranslateGemma 4B only | 5.00 s | 382.9 | 4B: 3 / 12B: 0 |
-| 4B + 12B long-text routing | 9.28 s | 206.4 | 4B: 2 / 12B: 1 |
-| TranslateGemma 12B only | 12.30 s | 155.8 | 4B: 0 / 12B: 3 |
-
-With the heavier default server settings (`c = 16384`, `parallel = 4`), keeping
-both 4B and 12B fully on a 12 GiB RTX 3060 was not reliable. For this extension,
-`c = 4096` and `parallel = 1` are a better fit because page text is translated
-in small segments rather than as one large document.
-
-### Gemma 4 E4B Reference
-
-Measured on 2026-07-27 with the same Secure Shell input above, using
-`gemma-4-E4B-it` (`unsloth/gemma-4-E4B-it-GGUF:Q4_K_M`) through llama.cpp.
-The server preset fits on the same 12 GiB RTX 3060 with full GPU offload and
-MTP draft decoding enabled:
-
-```ini
-[gemma-4-E4B-it]
-hf = unsloth/gemma-4-E4B-it-GGUF:Q4_K_M
-chat-template-file = /home/onoue/.local/lib/models/gemma-4-E4B-it-GGUF.jinja
-n-gpu-layers = all
-ctx-size = 393216
-parallel = 4
-spec-type = draft-mtp
-spec-draft-n-max = 2
-temp = 1.0
-top-p = 0.95
-top-k = 64
-```
-
-| Model / Pattern | Avg wall time | Source chars/s | Avg output tokens/s | Notes |
-|-----------------|---------------|----------------|---------------------|-------|
-| TranslateGemma 4B only | 5.00 s | 382.9 | 92.8 | Specialized TranslateGemma prompt |
-| TranslateGemma 4B + 12B routing | 9.28 s | 206.4 | - | Long segment routed to 12B |
-| TranslateGemma 12B only | 12.30 s | 155.8 | 37.4 | Specialized TranslateGemma prompt |
-| Gemma 4 E4B IT | 5.62 s | 341.0 | 108.5 | Generic instruction translation prompt, MTP enabled |
-
-Gemma 4 E4B produced longer Japanese output in this test, so wall time was a
-little slower than TranslateGemma 4B despite higher output token throughput.
-Because it still fits fully in 12 GiB with `parallel = 4` and MTP enabled, it is
-a promising single-model option when its translation quality is good enough.
-
-### Gemma 4 E4B QAT Comparison
-
-Measured on 2026-07-31 through the same llama.cpp router on an RTX 3060 12 GiB.
-This benchmark uses the bundled `scripts/benchmark.rb` input (8 English
-segments, 584 source characters), with one warmup run and three measured runs.
-It is intentionally separate from the Secure Shell reference above, which uses
-a longer input.
-
-| Model | Quantization | Avg wall time | Source chars/s | Avg output tokens/s |
-|-------|--------------|---------------|----------------|---------------------|
-| Gemma 4 E4B IT | `Q4_K_M` | 11.37 s | 52.0 | 127.8 |
-| Gemma 4 E4B IT QAT | `UD-Q4_K_XL` | 6.38 s | 94.0 | 203.0 |
-
-The QAT model reduced wall-clock time by 43.9% and increased generation
-throughput by 58.9% in this test. It is a strong speed option, but evaluate
-translation quality on the target content before making it the default.
-
-### Completion-length Comparison
-
-Measured on 2026-08-06 through the llama.cpp router on the same RTX 3060 12
-GiB machine. The request contained 8 English segments (1,218 source
-characters), used `temperature = 0`, disabled prompt caching, and allowed up
-to 4,096 completion tokens. Each result is the average of three runs after one
-warmup. Unlike a fixed-output benchmark, this records the time required for
-each model to finish naturally (`finish_reason = stop`).
-
-| Model | Avg wall time | Prompt eval | Prompt tok/s | Eval | Eval tok/s | Completion tokens |
-|-------|---------------|-------------|--------------|------|------------|-------------------|
-| TranslateGemma 4B | **5.18 s** | 127 ms | 2,572.2 | 5.03 s | 94.1 | 473 |
-| Gemma 4 E4B IT QAT | 8.38 s | 151 ms | 2,180.0 | 8.22 s | **204.1** | 1,677 |
-| TranslateGemma 12B | 10.51 s | 362 ms | 904.4 | 10.10 s | 38.8 | 392 |
-| LFM 2.5 2.6B | 19.03 s | **81 ms** | **4,037.2** | 18.94 s | 127.4 | **2,414** |
-| Gemma 4 12B IT QAT Imatrix | 33.71 s | 392 ms | 839.7 | 33.29 s | 62.9 | 2,093 |
-
-All five models stopped before the 4,096-token limit. This matters for
-translation latency: LFM 2.5 2.6B evaluates prompts and generates tokens
-quickly, but it produced about five times as many completion tokens as
-TranslateGemma 4B for this request. Its faster `eval tok/s` therefore does not
-translate to a faster completed translation. The extra completion length is
-consistent with a reasoning-oriented model spending more work on a simple
-translation task; inspect the actual translation quality before treating that
-as a universal conclusion.
-
-These figures compare the current per-model llama.cpp presets, including their
-quantization, context, parallelism, and speculative-decoding settings. They
-are useful for choosing a model on this machine, not as hardware-independent
-scores.
 
 ## Privacy
 
@@ -357,14 +77,25 @@ Click **Advanced Settings** to configure:
 
 | Setting | Description |
 |---------|-------------|
-| Provider | Auto-detect, Ollama only, or LMStudio/OpenAI-compatible only |
-| URLs | Custom endpoints for Ollama and LMStudio/OpenAI-compatible servers |
+| Provider | Auto-detect, Ollama only, or LMStudio only |
+| URLs | Custom endpoints for Ollama/LMStudio |
 | Max tokens/items per batch | Control batch sizes |
 | Temperature | Model creativity (lower = more consistent) |
 | Request Format (*work in progress*) | Default JSON, Hunyuan-MT, Simple, or Custom |
 | Show Glow | Toggle visual indicator on translated text |
 | Cache translations | Reuse stored translations for identical text — *off* (default), *until browser close*, or *across sessions*; includes a "Clear cache" button |
-| Retranslate/Discard Selection | Repair selected bad translations from the popup. Retranslate clears the matching cache entry first; discard restores original text and removes the cached result |
+| Automatically translate pages | Translate foreign-language pages on load, with never-lists for languages and sites — *off* by default |
+
+## Auto-Translate
+
+By default nothing is translated until you ask for it. Turn on **Options → Auto-Translate → Automatically translate pages** and a page is instead translated as soon as it loads, whenever it declares a language other than your target language.
+
+- **Undeclared pages are left alone.** The language is read from the page's `lang` attribute (or a `content-language` meta tag). Pages that declare nothing are skipped rather than guessed at — a wrong guess would spend real inference time making a page you can already read worse.
+- **Only top-level pages.** Iframes are skipped, so ads and embedded widgets don't multiply the request count.
+- **Escape hatches while it runs.** A small bar appears in the corner with **Stop** (halt and put the original text back) and **Never on this site** (same, plus adds the site to the exclusion list).
+- **Exclusions.** Keep a list of languages you already read, and a list of sites to leave alone. Site entries cover subdomains, so `example.com` also excludes `news.example.com`.
+
+This needs permission to run on all websites, since the extension has to be present on a page before you have asked for anything. Bear in mind that every page you open now costs a full translation run on your own hardware.
 
 ## Translation Cache
 
@@ -383,8 +114,6 @@ To avoid re-translating the same text over and over (forum boilerplate, menus, u
 
 Load a TSV dictionary (Options → Glossary) to pin translations for specific terms. Each line is `source<TAB>translation`; leave the second column empty to keep the term untranslated. Matching is case-sensitive. A `#target: ja` line declares the language the glossary translates into — the glossary is then only applied when that target language is selected (recommended, since a glossary maps terms into one specific language).
 
-To fix a translation while reading, select the translated segment, open the popup, click **Add to Glossary**, adjust the prefilled source if necessary, and enter the preferred translation. The term is saved immediately in the extension's local glossary and takes effect on subsequent translations. Use **Export TSV** in Options → Glossary to download the current built-in glossary.
-
 It works at two levels:
 
 - **Inside sentences** — glossary terms found in the text being translated are injected into the prompt as hard hints, so the model keeps proper nouns consistent (e.g. *The Companions* → *同胞団* everywhere). Only matching terms are sent, so a large dictionary is fine.
@@ -398,14 +127,11 @@ Whole-segment matches take priority over the translation cache, and loading or c
 ├── manifest.json      # Extension manifest (MV3)
 ├── background.js      # Background script (LLM API, settings)
 ├── content.js         # Content script (DOM manipulation)
-├── scripts/
-│   └── benchmark.rb   # Local provider translation benchmark
 ├── popup/
 │   ├── popup.html     # Popup UI
 │   ├── popup.css      # Styles (Everforest Dark theme)
 │   └── popup.js       # Popup logic
-├── icons/             # Extension icons
-└── mkxpi.sh           # Build an installable .xpi (no signing needed)
+└── icons/             # Extension icons
 ```
 
 ## Development

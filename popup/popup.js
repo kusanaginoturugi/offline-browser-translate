@@ -10,7 +10,6 @@ const DEFAULT_SETTINGS = {
     provider: 'auto',
     ollamaUrl: 'http://localhost:11434',
     lmstudioUrl: 'http://localhost:1234',
-    filterLlamaCppUiModels: false,
     selectedModel: '',
     targetLanguage: 'en',
     sourceLanguage: 'auto',
@@ -18,10 +17,8 @@ const DEFAULT_SETTINGS = {
     pinnedModels: [],
     maxTokensPerBatch: 2000,
     maxItemsPerBatch: 8,
-    maxConcurrentRequests: 4, // 1-4 parallel requests (LMStudio 0.4.0+ supports parallelism)
-    useAdvanced: false,
-    customSystemPrompt: '',
-    customUserPromptTemplate: '',
+    maxConcurrentRequests: 4, // 1-32 parallel requests (LMStudio 0.4.0+ supports parallelism)
+    customPrompts: {}, // per-format prompt overrides, edited on the options page
     requestFormat: 'auto',
     temperature: 0.3,
     useStructuredOutput: true,
@@ -31,7 +28,10 @@ const DEFAULT_SETTINGS = {
     numCtx: 0,
     cacheMode: 'off',
     debug: false,
-    floatingButton: false
+    floatingButton: false,
+    autoTranslatePages: false,
+    autoTranslateNeverLanguages: [],
+    autoTranslateNeverSites: []
 };
 
 // DOM Elements
@@ -56,32 +56,24 @@ const elements = {
     translateBtn: document.getElementById('translateBtn'),
     cancelBtn: document.getElementById('cancelBtn'),
     restoreBtn: document.getElementById('restoreBtn'),
-    retranslateSelectionBtn: document.getElementById('retranslateSelectionBtn'),
-    discardSelectionBtn: document.getElementById('discardSelectionBtn'),
-    addGlossaryEntryBtn: document.getElementById('addGlossaryEntryBtn'),
-    glossaryEntryForm: document.getElementById('glossaryEntryForm'),
-    glossarySource: document.getElementById('glossarySource'),
-    glossaryTranslation: document.getElementById('glossaryTranslation'),
-    cancelGlossaryEntryBtn: document.getElementById('cancelGlossaryEntryBtn'),
     toggleAdvanced: document.getElementById('toggleAdvanced'),
     advancedSection: document.getElementById('advancedSection'),
     providerSelect: document.getElementById('providerSelect'),
     ollamaUrl: document.getElementById('ollamaUrl'),
     lmstudioUrl: document.getElementById('lmstudioUrl'),
-    filterLlamaCppUiModels: document.getElementById('filterLlamaCppUiModels'),
-    maxTokens: document.getElementById('maxTokens'),
-    maxItems: document.getElementById('maxItems'),
-    temperature: document.getElementById('temperature'),
-    temperatureValue: document.getElementById('temperatureValue'),
-    showGlow: document.getElementById('showGlow'),
     cacheMode: document.getElementById('cacheMode'),
     cacheBackendWarning: document.getElementById('cacheBackendWarning'),
     cacheNewBadge: document.getElementById('cacheNewBadge'),
     clearCache: document.getElementById('clearCache'),
     cacheCount: document.getElementById('cacheCount'),
     floatingButton: document.getElementById('floatingButton'),
+    autoTranslatePages: document.getElementById('autoTranslatePages'),
+    autoTranslateOptionsLink: document.getElementById('autoTranslateOptionsLink'),
+    ignoredSiteNote: document.getElementById('ignoredSiteNote'),
+    unignoreSiteBtn: document.getElementById('unignoreSiteBtn'),
     saveSettings: document.getElementById('saveSettings'),
     openOptions: document.getElementById('openOptions'),
+    openOptionsHeader: document.getElementById('openOptionsHeader'),
     resetSettings: document.getElementById('resetSettings'),
     toast: document.getElementById('toast')
 };
@@ -183,6 +175,7 @@ async function init() {
     refreshCacheCount();
     refreshCacheBackend();
     initCacheNewBadge();
+    updateIgnoredSiteIndicator();
     await checkProviders();
     await loadModels();
     await checkTranslationStatus();
@@ -576,6 +569,38 @@ async function loadSettings() {
     }
 }
 
+let currentTabHostname = null;
+// Set by updateIgnoredSiteIndicator() to the actual never-list entry that
+// matched the tab (which may be a parent domain, e.g. "example.com" for a
+// tab on "news.example.com") - the un-ignore handler must remove THIS, not
+// the tab's own hostname, or removal silently no-ops for subdomain matches.
+let matchedNeverSite = null;
+
+// Surfaces a note (and un-ignore shortcut) when the active tab's site is on
+// the auto-translate never-list - people forget they clicked "Ignore site"
+// on the page widget, then wonder why auto-translate stopped working there.
+async function updateIgnoredSiteIndicator() {
+    if (!elements.ignoredSiteNote) return;
+    currentTabHostname = null;
+    matchedNeverSite = null;
+    try {
+        const [tab] = await browserAPI.tabs.query({ active: true, currentWindow: true });
+        if (tab && tab.url) currentTabHostname = new URL(tab.url).hostname.toLowerCase();
+    } catch (e) { /* non-http tab (chrome://, etc.) - leave hostname null */ }
+
+    if (!currentTabHostname) {
+        elements.ignoredSiteNote.hidden = true;
+        return;
+    }
+
+    const neverSites = Array.isArray(currentSettings.autoTranslateNeverSites) ? currentSettings.autoTranslateNeverSites : [];
+    matchedNeverSite = neverSites.find(entry => {
+        const site = String(entry || '').trim().toLowerCase();
+        return site && (currentTabHostname === site || currentTabHostname.endsWith('.' + site));
+    }) || null;
+    elements.ignoredSiteNote.hidden = !matchedNeverSite;
+}
+
 // Apply settings to UI
 function applySettingsToUI() {
     langPicker.setPinned(currentSettings.pinnedLanguages || []);
@@ -584,14 +609,9 @@ function applySettingsToUI() {
     elements.providerSelect.value = currentSettings.provider;
     elements.ollamaUrl.value = currentSettings.ollamaUrl;
     elements.lmstudioUrl.value = currentSettings.lmstudioUrl;
-    elements.filterLlamaCppUiModels.checked = !!currentSettings.filterLlamaCppUiModels;
-    elements.maxTokens.value = currentSettings.maxTokensPerBatch;
-    elements.maxItems.value = currentSettings.maxItemsPerBatch || 8;
-    elements.temperature.value = currentSettings.temperature;
-    elements.temperatureValue.textContent = currentSettings.temperature;
-    elements.showGlow.checked = currentSettings.showGlow !== false;
     if (elements.cacheMode) elements.cacheMode.value = currentSettings.cacheMode || 'off';
     if (elements.floatingButton) elements.floatingButton.checked = !!currentSettings.floatingButton;
+    if (elements.autoTranslatePages) elements.autoTranslatePages.checked = !!currentSettings.autoTranslatePages;
 
     // Restore source language override
     if (elements.sourceLangOverride && currentSettings.sourceLanguage) {
@@ -733,11 +753,11 @@ function bannerHTML(type) {
         <div style="font-weight: bold; margin-bottom: 4px; color: var(--yellow, #dbbc7f);">No LLM provider detected</div>
         <div>To use this extension, you need a local LLM server running:</div>
         <ol style="margin: 6px 0 2px 18px; padding: 0;">
-            <li>Install <a href="https://ollama.com" target="_blank" style="color: var(--accent, #a7c080);">Ollama</a>, <a href="https://lmstudio.ai" target="_blank" style="color: var(--accent, #a7c080);">LMStudio</a> or <a href="https://github.com/ggml-org/llama.cpp" target="_blank" style="color: var(--accent, #a7c080);">llama.cpp</a></li>
+            <li>Install <a href="https://ollama.com" target="_blank" style="color: var(--accent, #a7c080);">Ollama</a> or <a href="https://lmstudio.ai" target="_blank" style="color: var(--accent, #a7c080);">LMStudio</a></li>
             <li>Load a translation model (e.g. <code style="background: var(--bg1, #2b2b2b); padding: 1px 4px; border-radius: 3px;">ollama pull translategemma</code>)</li>
             <li>Click the refresh button above</li>
         </ol>
-        <div style="margin-top: 4px; font-size: 11px; opacity: 0.8;">llama.cpp, vLLM and other OpenAI-compatible servers also work — put their base URL in the LMStudio URL field.</div>
+        <div style="margin-top: 4px; font-size: 11px; opacity: 0.8;">llama.cpp, vLLM and other OpenAI-compatible servers also work. Put their base URL in the LMStudio URL field.</div>
     `;
 }
 
@@ -796,8 +816,7 @@ async function loadModels(forceRefresh = false) {
                 // If any provider is blocked by CORS, prioritize showing the CORS banner
                 const detectResponse = await browserAPI.runtime.sendMessage({ type: 'DETECT_PROVIDERS' }).catch(() => ({}));
                 if (detectResponse.ollama_blocked || detectResponse.lmstudio_blocked) {
-                    showSetupBanner(detectResponse.ollama_blocked ? 'cors-blocked-ollama'
-                        : 'cors-blocked-lmstudio');
+                    showSetupBanner(detectResponse.ollama_blocked ? 'cors-blocked-ollama' : 'cors-blocked-lmstudio');
                 } else {
                     showSetupBanner('no-models');
                 }
@@ -837,150 +856,22 @@ async function saveCurrentSettings() {
         provider: elements.providerSelect.value,
         ollamaUrl: elements.ollamaUrl.value,
         lmstudioUrl: elements.lmstudioUrl.value,
-        filterLlamaCppUiModels: elements.filterLlamaCppUiModels.checked,
         selectedModel: modelPicker.getValue(),
         pinnedModels: [...modelPicker.pinned],
         targetLanguage: langPicker.getValue(),
         pinnedLanguages: langPicker.pinned,
-        maxTokensPerBatch: parseInt(elements.maxTokens.value) || 2000,
-        maxItemsPerBatch: parseInt(elements.maxItems.value) || 8,
-        temperature: parseFloat(elements.temperature.value) || 0.3,
-        showGlow: elements.showGlow.checked,
         cacheMode: elements.cacheMode ? elements.cacheMode.value : 'off',
         // Save the source language override preference
         sourceLanguage: elements.sourceLangOverride ? elements.sourceLangOverride.value : 'auto'
-        // Request format, structured-output and custom prompts are managed in
-        // the full Settings page; we omit them here so the background merge keeps
-        // whatever was configured there.
+        // Request format, structured-output, batch/temperature tuning, glow and custom
+        // prompts are managed in the full Settings page; we omit them here so the
+        // background merge keeps whatever was configured there.
     };
 
     await browserAPI.runtime.sendMessage({
         type: 'SAVE_SETTINGS',
         settings: currentSettings
     });
-}
-
-function assertTranslatableTab(tab) {
-    if (!tab || !tab.id) {
-        throw new Error('No active tab found');
-    }
-    if (tab.url && (tab.url.startsWith('about:') || tab.url.startsWith('chrome:') ||
-        tab.url.startsWith('moz-extension:') || tab.url.startsWith('chrome-extension:'))) {
-        throw new Error('Cannot translate browser internal pages.');
-    }
-}
-
-async function ensureContentScript(tab) {
-    try {
-        await browserAPI.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ['/content.js']
-        });
-    } catch (injectErr) {
-        debugLog('[Popup] Script injection note:', injectErr.message);
-    }
-
-    for (let i = 0; i < 15; i++) {
-        try {
-            const resp = await browserAPI.tabs.sendMessage(tab.id, { type: 'PING' });
-            if (resp && resp.pong) return;
-        } catch { }
-        await new Promise(r => setTimeout(r, 100));
-    }
-
-    throw new Error('Could not connect to page. Try refreshing the page first.');
-}
-
-function resolveSourceLanguage() {
-    if (currentSettings.sourceLanguage && currentSettings.sourceLanguage !== 'auto') {
-        return currentSettings.sourceLanguage;
-    }
-    return detectedPageLanguage || 'auto';
-}
-
-async function runSelectionCommand(type) {
-    const model = modelPicker.getValue();
-    if (!model && type !== 'DISCARD_SELECTION_TRANSLATION') {
-        showToast('Please select a model first', 'error');
-        return;
-    }
-
-    if (!providersAvailable && type !== 'DISCARD_SELECTION_TRANSLATION') {
-        showToast('No LLM provider running. Start Ollama or LMStudio first.', 'error');
-        return;
-    }
-
-    const activeButton = type === 'RETRANSLATE_SELECTION'
-        ? elements.retranslateSelectionBtn
-        : elements.discardSelectionBtn;
-    activeButton.disabled = true;
-
-    try {
-        await saveCurrentSettings();
-        const [tab] = await browserAPI.tabs.query({ active: true, currentWindow: true });
-        assertTranslatableTab(tab);
-        await ensureContentScript(tab);
-
-        const response = await browserAPI.tabs.sendMessage(tab.id, {
-            type,
-            targetLanguage: currentSettings.targetLanguage,
-            sourceLanguage: resolveSourceLanguage(),
-            showGlow: currentSettings.showGlow,
-            maxConcurrentRequests: currentSettings.maxConcurrentRequests || 4
-        });
-
-        if (response?.error) {
-            throw new Error(response.error);
-        }
-
-        showToast(type === 'RETRANSLATE_SELECTION'
-            ? 'Retranslating selected text'
-            : 'Discarded selected translation');
-    } catch (e) {
-        console.error('Selection action error:', e);
-        showToast(`Error: ${e.message}`, 'error');
-    } finally {
-        activeButton.disabled = false;
-    }
-}
-
-async function openGlossaryEntryForm() {
-    try {
-        const [tab] = await browserAPI.tabs.query({ active: true, currentWindow: true });
-        assertTranslatableTab(tab);
-        await ensureContentScript(tab);
-        const response = await browserAPI.tabs.sendMessage(tab.id, { type: 'GET_SELECTION_GLOSSARY_CONTEXT' });
-        if (!response?.ok) throw new Error(response?.error || 'Could not read selected text');
-        elements.glossarySource.value = response.source;
-        elements.glossaryTranslation.value = '';
-        elements.glossaryEntryForm.hidden = false;
-        elements.glossaryTranslation.focus();
-    } catch (e) {
-        showToast(`Error: ${e.message}`, 'error');
-    }
-}
-
-async function saveGlossaryEntry(event) {
-    event.preventDefault();
-    const source = elements.glossarySource.value.trim();
-    const translation = elements.glossaryTranslation.value.trim();
-    if (!source || !translation) {
-        showToast('Enter both source and preferred translation', 'error');
-        return;
-    }
-    try {
-        const response = await browserAPI.runtime.sendMessage({
-            type: 'UPSERT_GLOSSARY_ENTRY',
-            source,
-            translation,
-            targetLanguage: currentSettings.targetLanguage
-        });
-        if (!response?.ok) throw new Error(response?.error || 'Could not save glossary entry');
-        elements.glossaryEntryForm.hidden = true;
-        showToast(`Saved to glossary (${response.count} terms)`);
-    } catch (e) {
-        showToast(`Error: ${e.message}`, 'error');
-    }
 }
 
 // Reset the translate button back to its idle state
@@ -1143,31 +1034,6 @@ function setupEventListeners() {
     // Restore/Toggle button
     elements.restoreBtn.addEventListener('click', toggleTranslation);
 
-    // Selection repair actions
-    if (elements.retranslateSelectionBtn) {
-        elements.retranslateSelectionBtn.addEventListener('click', () => {
-            runSelectionCommand('RETRANSLATE_SELECTION');
-        });
-    }
-
-    if (elements.discardSelectionBtn) {
-        elements.discardSelectionBtn.addEventListener('click', () => {
-            runSelectionCommand('DISCARD_SELECTION_TRANSLATION');
-        });
-    }
-
-    if (elements.addGlossaryEntryBtn) {
-        elements.addGlossaryEntryBtn.addEventListener('click', openGlossaryEntryForm);
-    }
-    if (elements.glossaryEntryForm) {
-        elements.glossaryEntryForm.addEventListener('submit', saveGlossaryEntry);
-    }
-    if (elements.cancelGlossaryEntryBtn) {
-        elements.cancelGlossaryEntryBtn.addEventListener('click', () => {
-            elements.glossaryEntryForm.hidden = true;
-        });
-    }
-
     // Refresh models
     elements.refreshModels.addEventListener('click', async () => {
         await checkProviders();
@@ -1193,34 +1059,68 @@ function setupEventListeners() {
                     showToast('Permission denied', 'error');
                     return;
                 }
-                await browserAPI.runtime.sendMessage({ type: 'REGISTER_CONTENT_SCRIPT' });
-                showToast('Floating button enabled — reload pages to activate');
+                showToast('Floating button enabled. Reload pages to activate');
             } else {
-                await browserAPI.runtime.sendMessage({ type: 'UNREGISTER_CONTENT_SCRIPT' });
-                try { await browserAPI.permissions.remove({ origins: ['<all_urls>'] }); } catch (e) {}
-                showToast('Floating button disabled — permission removed');
+                showToast('Floating button disabled');
             }
             currentSettings.floatingButton = e.target.checked;
             await browserAPI.runtime.sendMessage({ type: 'SAVE_SETTINGS', settings: currentSettings });
+            // Background decides whether content.js stays registered — auto-translate
+            // may still need it even with the floating button off.
+            await browserAPI.runtime.sendMessage({ type: 'SYNC_CONTENT_SCRIPT' });
+            if (!e.target.checked && !currentSettings.autoTranslatePages) {
+                try { await browserAPI.permissions.remove({ origins: ['<all_urls>'] }); } catch (err) {}
+            }
         });
     }
 
-    // Temperature slider
-    elements.temperature.addEventListener('input', (e) => {
-        elements.temperatureValue.textContent = e.target.value;
-    });
+    // Auto-translate-on-load toggle — permission required to enable, same
+    // shared-permission bookkeeping as the floating button above. Per-language/
+    // per-site exceptions still live in the full Settings page only.
+    if (elements.autoTranslatePages) {
+        elements.autoTranslatePages.addEventListener('change', async (e) => {
+            if (e.target.checked) {
+                const granted = await browserAPI.permissions.request({ origins: ['<all_urls>'] });
+                if (!granted) {
+                    e.target.checked = false;
+                    showToast('Permission denied', 'error');
+                    return;
+                }
+                showToast('Auto-translate enabled. Reload pages to activate');
+            } else {
+                showToast('Auto-translate disabled');
+            }
+            currentSettings.autoTranslatePages = e.target.checked;
+            await browserAPI.runtime.sendMessage({ type: 'SAVE_SETTINGS', settings: currentSettings });
+            await browserAPI.runtime.sendMessage({ type: 'SYNC_CONTENT_SCRIPT' });
+            if (!e.target.checked && !currentSettings.floatingButton) {
+                try { await browserAPI.permissions.remove({ origins: ['<all_urls>'] }); } catch (err) {}
+            }
+        });
+    }
 
-    // Provider change — save it and reload the model list for the new provider
-    elements.providerSelect.addEventListener('change', async () => {
-        await saveCurrentSettings();
-        await checkProviders();
-        await loadModels(true);
-    });
+    if (elements.autoTranslateOptionsLink) {
+        elements.autoTranslateOptionsLink.addEventListener('click', () => {
+            browserAPI.runtime.openOptionsPage();
+        });
+    }
 
-    elements.filterLlamaCppUiModels.addEventListener('change', async () => {
-        await saveCurrentSettings();
-        await loadModels(true);
-    });
+    if (elements.unignoreSiteBtn) {
+        elements.unignoreSiteBtn.addEventListener('click', async () => {
+            if (!matchedNeverSite) return;
+            try {
+                const res = await browserAPI.runtime.sendMessage({
+                    type: 'REMOVE_AUTO_TRANSLATE_NEVER_SITE',
+                    hostname: matchedNeverSite
+                });
+                if (res && res.sites) currentSettings.autoTranslateNeverSites = res.sites;
+                elements.ignoredSiteNote.hidden = true;
+                showToast('Un-ignored. Reload the page to auto-translate it.');
+            } catch (e) {
+                showToast('Could not update the site list', 'error');
+            }
+        });
+    }
 
     // Save settings button
     elements.saveSettings.addEventListener('click', async () => {
@@ -1232,7 +1132,7 @@ function setupEventListeners() {
         ]);
         await saveCurrentSettings();
         if (!granted) {
-            showToast('Saved, but permission for the custom server was denied — remote models won\'t load until you allow it.', 'error', 5000);
+            showToast('Saved, but permission for the custom server was denied. Remote models won\'t load until you allow it.', 'error', 5000);
         } else {
             showToast('Settings saved!');
         }
@@ -1243,28 +1143,14 @@ function setupEventListeners() {
     // (Target-language changes are handled by langPicker.onChange.)
     // (Model changes are handled by modelPicker.onChange.)
 
-    // Glow toggle - update in real-time
-    elements.showGlow.addEventListener('change', async () => {
-        currentSettings.showGlow = elements.showGlow.checked;
-        await saveCurrentSettings();
-        // Send to content script to update existing translations
-        try {
-            const [tab] = await browserAPI.tabs.query({ active: true, currentWindow: true });
-            if (tab && tab.id) {
-                await browserAPI.tabs.sendMessage(tab.id, {
-                    type: 'SET_GLOW',
-                    enabled: currentSettings.showGlow
-                });
-            }
-        } catch (e) {
-            // Content script may not be loaded
-        }
-    });
-
-
     // Open options page
     if (elements.openOptions) {
         elements.openOptions.addEventListener('click', () => {
+            browserAPI.runtime.openOptionsPage();
+        });
+    }
+    if (elements.openOptionsHeader) {
+        elements.openOptionsHeader.addEventListener('click', () => {
             browserAPI.runtime.openOptionsPage();
         });
     }
@@ -1285,6 +1171,8 @@ function setupEventListeners() {
                 type: 'SAVE_SETTINGS',
                 settings: currentSettings
             });
+            // Defaults turn off both all-sites features, so drop the registration.
+            await browserAPI.runtime.sendMessage({ type: 'SYNC_CONTENT_SCRIPT' });
             applySettingsToUI();
             showToast('Settings reset to defaults');
         });
