@@ -51,6 +51,7 @@ const segmentToNodeIdMap = new Map(); // Maps segmentId -> nodeId
 const translatedNodeSet = new Set(); // Track which nodes have been translated
 let translationInProgress = false;
 let translationCancelled = false;  // Flag to cancel ongoing translation
+let translationGeneration = 0;     // Invalidates responses from a stopped run
 let nextNodeId = 0;
 let nextSegmentId = 0;
 let currentTargetLanguage = 'en';
@@ -861,9 +862,11 @@ function showToast(message, isError = false) {
  * caller is about to show its own, more specific completion message. */
 function stopCurrentTranslation({ silent = false } = {}) {
     translationCancelled = true;
+    translationGeneration++;
     suppressCancelMessage = silent;
     pendingTranslationQueue = [];
     stopAutoTranslate();
+    browserAPI.runtime.sendMessage({ type: 'CANCEL_TRANSLATION' }).catch(() => {});
 }
 
 // LM Studio JIT-loads models on the first request, which can take a while
@@ -987,6 +990,8 @@ async function maybeAutoTranslatePage(settings) {
  */
 async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto', retries = 3) {
     if (textItems.length === 0) return { applied: 0, failed: [] };
+    const generation = translationGeneration;
+    const cancelledResult = { applied: 0, failed: [], fromCache: 0, total: textItems.length, cacheActive: false };
 
     debugLog(`[Translator] translateBatch called for ${textItems.length} items:`, textItems);
 
@@ -997,6 +1002,7 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
 
     let lastError = null;
     for (let attempt = 0; attempt < retries; attempt++) {
+        if (generation !== translationGeneration) return cancelledResult;
         try {
             if (attempt > 0) {
                 debugLog(`[Translator] Retrying batch, attempt ${attempt + 1}/${retries}`);
@@ -1007,6 +1013,7 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
                 targetLanguage,
                 sourceLanguage: pageLanguage // Pass detected page language for TranslateGemma
             });
+            if (generation !== translationGeneration) return cancelledResult;
 
             debugLog(`[Translator] translateBatch response:`, response);
 
@@ -1064,6 +1071,7 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
             };
 
         } catch (e) {
+            if (generation !== translationGeneration) return cancelledResult;
             lastError = e;
             console.warn(`[Translator] Attempt ${attempt + 1}/${retries} failed:`, e.message);
             debugWarn(`[Translator] Batch translation failed with exception:`, e, 'on items:', textItems);
@@ -1639,3 +1647,10 @@ document.addEventListener('selectionchange', () => {
 window.addEventListener('scroll', () => {
     if (floatingTranslateBtn && floatingTranslateBtn.style.display !== 'none') hideFloatingBtn();
 }, { passive: true });
+
+// A page that goes away cannot use its pending translations. Release the
+// server request instead of leaving it to run until the timeout.
+window.addEventListener('pagehide', () => {
+    if (!translationInProgress) return;
+    browserAPI.runtime.sendMessage({ type: 'CANCEL_TRANSLATION' }).catch(() => {});
+});
