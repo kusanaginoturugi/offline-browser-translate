@@ -2,6 +2,8 @@
   <img src="assets/logo.png" width="48" valign="middle"> Local LLM Translator
 </h1>
 
+Fork maintenance notes: [upstream 1.7.0 sync](docs/fork-sync-2026-10-20.md).
+
 A privacy-focused browser extension that translates web pages using local LLMs (Ollama or LMStudio). **Your data never leaves your machine.**
 
 [![Get the Add-on](https://extensionworkshop.com/assets/img/documentation/publish/get-the-addon-178x60px.dad84b42.png)](https://addons.mozilla.org/en-GB/firefox/addon/local-llm-translator/)
