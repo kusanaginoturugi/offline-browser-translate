@@ -26,6 +26,7 @@ browserAPI.runtime.sendMessage({ type: 'GET_SETTINGS' }).then(r => {
         debugEnabled = !!r.settings.debug;
         if (r.settings.targetLanguage) currentTargetLanguage = r.settings.targetLanguage;
         floatingButtonEnabled = !!r.settings.floatingButton;
+        maybeAutoTranslatePage(r.settings);
     }
 }).catch(() => {});
 
@@ -50,17 +51,16 @@ const segmentToNodeIdMap = new Map(); // Maps segmentId -> nodeId
 const translatedNodeSet = new Set(); // Track which nodes have been translated
 let translationInProgress = false;
 let translationCancelled = false;  // Flag to cancel ongoing translation
+let translationGeneration = 0;     // Invalidates responses from a stopped run
 let nextNodeId = 0;
 let nextSegmentId = 0;
 let currentTargetLanguage = 'en';
-let maxConcurrentRequests = 4; // Default parallel requests (LMStudio 0.4.0+ supports up to 4)
+let maxConcurrentRequests = 4; // Default parallel requests (1-32, tunable in Settings > Performance)
 let autoTranslateEnabled = false;
 let showGlow = false; // Setting for glow effect (disabled by default)
 let mutationObserver = null;
 let pendingNewNodes = [];
 let autoTranslateDebounceTimer = null;
-let openedDetailsToTranslate = new Set();
-let openedDetailsTimer = null;
 
 // Translation state for toggle functionality
 let hasTranslationCache = false; // True if we have cached translations
@@ -87,10 +87,7 @@ function shouldSkipElement(element) {
     if (!element || !element.tagName) return true;
     if (element.isContentEditable) return true;
 
-    // Check element and ancestors for SKIP_TAGS, translate="no", or our extension elements.
-    // Closed <details> often holds long, optional sections (accordions,
-    // requirements, footnotes). Keep its <summary> visible and translatable,
-    // but defer everything else until the user opens it.
+    // Check element and ancestors for SKIP_TAGS, translate="no", or our extension elements
     let curr = element;
     while (curr) {
         if (curr.tagName && SKIP_TAGS.has(curr.tagName)) {
@@ -101,10 +98,6 @@ function shouldSkipElement(element) {
         }
         if (curr.id === 'llm-translator-status' || curr.id === 'llm-translator-float-btn') {
             return true;
-        }
-        if (curr.tagName === 'DETAILS' && !curr.open) {
-            const summary = element.closest('summary');
-            if (!summary || summary.parentElement !== curr) return true;
         }
         curr = curr.parentElement;
     }
@@ -124,45 +117,6 @@ function isTranslatableText(text) {
     // Use Unicode-aware check - look for any letter character
     const hasLetters = /\p{L}/u.test(trimmed);
     return hasLetters;
-}
-
-/**
- * Map a target language code to a regex matching its writing system.
- * Used to skip text that is already written in the target script, so a
- * mixed-language page only sends the parts that still need translating.
- * Latin-script targets (en, es, fr, ...) are intentionally absent: telling
- * two Latin-script languages apart needs real language detection.
- */
-const TARGET_SCRIPT_PATTERNS = {
-    ja: /[\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}]/u,
-    zh: /\p{sc=Han}/u,
-    ko: /\p{sc=Hangul}/u,
-    ru: /\p{sc=Cyrillic}/u,
-    uk: /\p{sc=Cyrillic}/u,
-    bg: /\p{sc=Cyrillic}/u,
-    sr: /\p{sc=Cyrillic}/u,
-    ar: /\p{sc=Arabic}/u,
-    fa: /\p{sc=Arabic}/u,
-    he: /\p{sc=Hebrew}/u,
-    el: /\p{sc=Greek}/u,
-    th: /\p{sc=Thai}/u,
-    hi: /\p{sc=Devanagari}/u
-};
-
-/**
- * True if `text` is already predominantly written in the target language's
- * script, so re-translating it is wasted work and risks corrupting it.
- * Returns false for unknown / Latin-script targets (we don't guess).
- */
-function isAlreadyTargetScript(text) {
-    const code = (currentTargetLanguage || '').toLowerCase().split('-')[0];
-    const scriptRe = TARGET_SCRIPT_PATTERNS[code];
-    if (!scriptRe) return false;
-    const letters = text.match(/\p{L}/gu);
-    if (!letters || letters.length === 0) return false;
-    let inScript = 0;
-    for (const ch of letters) if (scriptRe.test(ch)) inScript++;
-    return inScript / letters.length >= 0.7;
 }
 
 /**
@@ -220,8 +174,7 @@ function isNodeProcessed(node) {
  * Factors: viewport visibility, semantic context (main vs sidebar), parent tag type.
  */
 const TAG_PRIORITY = {
-    H1: 260, H2: 240, H3: 220, H4: 200, H5: 190, H6: 180, SUMMARY: 170,
-    P: 80,
+    P: 80, H1: 70, H2: 60, H3: 50, H4: 40, H5: 40, H6: 40,
     LI: 30, BLOCKQUOTE: 25, FIGCAPTION: 25, TD: 20, TH: 20,
     SPAN: 5, DIV: 5, A: -10, LABEL: -30, BUTTON: -50
 };
@@ -246,14 +199,6 @@ function calculatePriority(node) {
         priority -= 300;
     }
 
-    // Chapter titles and accordion labels are usually the best first clue to a
-    // page's structure, even when their text sits inside a nested <span>.
-    if (parent.closest('h1, h2, h3, h4, h5, h6, [role="heading"]')) {
-        priority += 700;
-    } else if (parent.closest('summary')) {
-        priority += 600;
-    }
-
     // Tag type
     priority += TAG_PRIORITY[parent.tagName] || 0;
 
@@ -274,7 +219,7 @@ function registerTextNode(node) {
         ? splitIntoSentences(originalText) : [originalText];
 
     for (const rawSeg of rawSegments) {
-        if (isTranslatableText(rawSeg) && !isAlreadyTargetScript(rawSeg)) {
+        if (isTranslatableText(rawSeg)) {
             const segmentId = nextSegmentId++;
             segmentToNodeIdMap.set(segmentId, nodeId);
             segments.push({
@@ -481,12 +426,6 @@ function replaceTextNode(segmentId, translatedText) {
         return false;
     }
 
-    // Node may have been detached (e.g. SPA navigation) — skip so we don't
-    // count an invisible replacement as applied or leave a stale flag.
-    if (!node.isConnected) {
-        return false;
-    }
-
     try {
         const segOriginalText = segment.originalText;
         const leadingSpace = segOriginalText.match(/^\s*/)[0];
@@ -578,117 +517,393 @@ function restoreCachedTranslations() {
     return restoredCount > 0;
 }
 
-function reconstructNodeText(entry) {
-    const joinedText = entry.segments.map(s =>
-        s.translated && s.processedTranslatedText !== null ? s.processedTranslatedText : s.originalText
-    ).join('');
-    entry.node.textContent = joinedText;
+// ============================================================================
+// Translation progress widget (bottom-right)
+//
+// One small green pill serves both the "in-progress" state (message, stop
+// button) and short one-off toasts (e.g. "Restored original text"). While a
+// translation is running, it morphs down into a small percent circle after a
+// few idle seconds and morphs back open on hover.
+// ============================================================================
 
-    const hasAnyTranslated = entry.segments.some(s => s.translated);
-    const parent = entry.node.parentElement;
-    if (parent) {
-        if (hasAnyTranslated) {
-            if (showGlow) {
-                parent.style.textShadow = '0 0 8px #7FBBB3, 0 0 2px #7FBBB3';
-            }
-            parent.dataset.translated = 'true';
-            translatedNodeSet.add(entry.node);
-        } else {
-            parent.style.textShadow = '';
-            delete parent.dataset.translated;
-            translatedNodeSet.delete(entry.node);
+let widgetEl = null;
+let widgetMinimizeTimer = null;
+let widgetHideTimer = null;
+let widgetHovered = false;
+let widgetState = 'idle'; // 'idle' | 'progress' | 'complete'
+// Set when a cancellation is a step inside a more specific action (e.g.
+// "Ignore site") that's about to show its own message - keeps the generic
+// "Translation cancelled" from flashing on screen for a moment first.
+let suppressCancelMessage = false;
+
+function ensureWidgetStyles() {
+    if (document.getElementById('llm-translator-widget-style')) return;
+    const style = document.createElement('style');
+    style.id = 'llm-translator-widget-style';
+    style.textContent = `
+        #llm-translator-status.ltw, #llm-translator-status.ltw *, #llm-translator-status.ltw *::before, #llm-translator-status.ltw *::after {
+            box-sizing: border-box;
         }
-    }
-}
-
-function resetSegmentsToOriginal(segmentIds) {
-    const ids = new Set(segmentIds);
-    const touchedNodeIds = new Set();
-    let restored = 0;
-
-    for (const segmentId of ids) {
-        const nodeId = segmentToNodeIdMap.get(segmentId);
-        if (nodeId === undefined) continue;
-        const entry = textNodeMap.get(nodeId);
-        if (!entry || !entry.node.isConnected) continue;
-        const segment = entry.segments.find(s => s.id === segmentId);
-        if (!segment) continue;
-
-        if (segment.translated || segment.processedTranslatedText !== null || segment.translatedText !== null) {
-            restored++;
+        #llm-translator-status.ltw {
+            position: fixed; bottom: 20px; right: 20px; z-index: 999999;
+            overflow: hidden; background: #A7C080; color: #1E2326;
+            font-family: system-ui, -apple-system, sans-serif; font-size: 13px; line-height: 1.4;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2); user-select: none;
+            width: 40px; max-height: 40px; border-radius: 20px;
+            opacity: 0; transform: translateY(10px) scale(0.92); pointer-events: none;
+            /* --ltw-width-duration lets JS use a near-instant width change when the
+               box is already open and just resizing for new text (nothing to morph,
+               so no reason to let text sit ellipsis-truncated for 0.35s while it
+               catches up) vs the full 0.35s "stretch" when actually morphing open
+               from the minimized circle. */
+            transition: opacity 0.25s ease, transform 0.25s ease,
+                width var(--ltw-width-duration, 0.35s) cubic-bezier(.4,0,.2,1),
+                max-height 0.35s cubic-bezier(.4,0,.2,1), border-radius 0.35s cubic-bezier(.4,0,.2,1),
+                background-color 0.2s ease;
         }
-        segment.translatedText = null;
-        segment.processedTranslatedText = null;
-        segment.translated = false;
-        touchedNodeIds.add(nodeId);
-    }
-
-    for (const nodeId of touchedNodeIds) {
-        const entry = textNodeMap.get(nodeId);
-        if (entry) reconstructNodeText(entry);
-    }
-
-    isShowingTranslations = [...textNodeMap.values()].some(entry => entry.segments.some(s => s.translated));
-    hasTranslationCache = [...textNodeMap.values()].some(entry =>
-        entry.segments.some(s => s.translatedText !== null || s.processedTranslatedText !== null)
-    );
-    return restored;
-}
-
-async function clearCacheForTextItems(textItems, targetLanguage, sourceLanguage) {
-    const texts = [...new Set(textItems.map(item => item.text).filter(Boolean))];
-    if (texts.length === 0) return 0;
-    const response = await browserAPI.runtime.sendMessage({
-        type: 'CLEAR_TRANSLATION_CACHE_ENTRIES',
-        texts,
-        targetLanguage,
-        sourceLanguage
-    });
-    return response?.removed || 0;
-}
-
-/**
- * Show translation status indicator
- */
-function showStatus(message, isError = false) {
-    let statusEl = document.getElementById('llm-translator-status');
-
-    if (!statusEl) {
-        statusEl = document.createElement('div');
-        statusEl.id = 'llm-translator-status';
-        statusEl.setAttribute('translate', 'no');
-        statusEl.style.cssText = `
-      position: fixed;
-      bottom: 20px;
-      right: 20px;
-      padding: 12px 20px;
-      border-radius: 8px;
-      font-family: system-ui, -apple-system, sans-serif;
-      font-size: 14px;
-      z-index: 999999;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-      transition: opacity 0.3s, transform 0.3s;
+        #llm-translator-status.ltw.ltw-visible { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
+        #llm-translator-status.ltw-error { background: #E67E80; }
+        #llm-translator-status.ltw-expanded { width: var(--ltw-expanded-width, 160px); max-height: 42px; border-radius: 12px; }
+        #llm-translator-status.ltw-minimized { width: 40px; max-height: 40px; border-radius: 20px; cursor: pointer; }
+        #llm-translator-status .ltw-content {
+            position: relative; z-index: 1; padding: 8px 8px 8px 12px;
+            /* Delayed so text only fades in once the width transition (0.35s) has
+               mostly finished - otherwise it's visible (and ellipsis-truncated)
+               while the box is still mid-widen, flashing half the message. */
+            opacity: 1; transition: opacity 0.15s ease 0.2s;
+        }
+        #llm-translator-status.ltw-minimized .ltw-content { opacity: 0; pointer-events: none; }
+        #llm-translator-status .ltw-row { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; }
+        #llm-translator-status .ltw-message {
+            flex: 1 1 auto; min-width: 0; font-size: 13px; font-weight: 600;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        #llm-translator-status .ltw-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; margin-left: auto; }
+        /* The [hidden] attribute alone loses to the rule above (author CSS always
+           beats the UA stylesheet's [hidden]{display:none}, regardless of
+           specificity) - without this, "hiding" the actions row did nothing:
+           the stop/ignore-site buttons kept rendering and eating into the row's
+           width, squeezing the message far narrower than measureContentWidth()
+           had budgeted for (which correctly assumes the hidden actions take 0px). */
+        #llm-translator-status .ltw-actions[hidden] { display: none; }
+        #llm-translator-status .ltw-btn {
+            background: rgba(30,35,38,0.14); border: 1px solid rgba(30,35,38,0.4); color: #1E2326;
+            padding: 3px 8px; border-radius: 5px; cursor: pointer; font-family: inherit; font-size: 11px; font-weight: 600;
+            width: auto; flex-shrink: 0; white-space: nowrap; transition: background 0.15s ease;
+        }
+        #llm-translator-status .ltw-btn:hover { background: rgba(30,35,38,0.26); }
+        #llm-translator-status .ltw-icon-btn {
+            display: flex; align-items: center; justify-content: center;
+            width: 22px; height: 22px; padding: 0; flex-shrink: 0;
+            border-radius: 50%; border: 1px solid rgba(30,35,38,0.3); cursor: pointer;
+            transition: background 0.15s ease, filter 0.15s ease;
+        }
+        /* Same [hidden]-vs-author-display fix as .ltw-actions above. */
+        #llm-translator-status .ltw-icon-btn[hidden] { display: none; }
+        #llm-translator-status .ltw-icon-btn.ltw-stop { background: #E67E80; color: #1E2326; }
+        #llm-translator-status .ltw-icon-btn.ltw-stop:hover { filter: brightness(0.93); }
+        #llm-translator-status .ltw-icon-btn svg { width: 9px; height: 9px; }
+        #llm-translator-status .ltw-ring {
+            position: absolute; inset: 0; border-radius: 50%; pointer-events: none;
+            background: conic-gradient(#1E2326 calc(var(--ltw-pct, 0) * 1%), rgba(30,35,38,0.22) 0);
+            -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+            mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+            opacity: 0; transition: opacity 0.15s ease;
+        }
+        #llm-translator-status.ltw-minimized .ltw-ring { opacity: 1; }
+        #llm-translator-status .ltw-mini-pct {
+            position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+            font-size: 11px; font-weight: 700; opacity: 0; pointer-events: none; transition: opacity 0.15s ease;
+        }
+        #llm-translator-status.ltw-minimized .ltw-mini-pct { opacity: 1; }
     `;
-        document.body.appendChild(statusEl);
+    document.head.appendChild(style);
+}
+
+function getWidget() {
+    if (widgetEl) return widgetEl;
+    ensureWidgetStyles();
+
+    const el = document.createElement('div');
+    el.id = 'llm-translator-status';
+    el.setAttribute('translate', 'no');
+    el.className = 'ltw';
+    el.innerHTML = `
+        <div class="ltw-content">
+            <div class="ltw-row">
+                <span class="ltw-message"></span>
+                <div class="ltw-actions" hidden>
+                    <button type="button" class="ltw-btn ltw-never" hidden>Ignore site</button>
+                    <button type="button" class="ltw-icon-btn ltw-stop" title="Stop translation" aria-label="Stop translation">
+                        <svg viewBox="0 0 10 10" fill="currentColor"><rect x="0" y="0" width="10" height="10" rx="1.5"></rect></svg>
+                    </button>
+                </div>
+            </div>
+        </div>
+        <div class="ltw-ring"></div>
+        <span class="ltw-mini-pct"></span>
+    `;
+    document.body.appendChild(el);
+    widgetEl = el;
+
+    el.querySelector('.ltw-stop').addEventListener('click', () => stopCurrentTranslation());
+    el.querySelector('.ltw-never').addEventListener('click', async () => {
+        stopCurrentTranslation({ silent: true });
+        try {
+            await browserAPI.runtime.sendMessage({
+                type: 'ADD_AUTO_TRANSLATE_NEVER_SITE',
+                hostname: location.hostname
+            });
+            // Un-ignoring a site lives in the popup's Quick Settings instead
+            // (plenty of room there, and no translation to resume anyway - the
+            // page needs a reload regardless once the site's un-ignored).
+            showToast(`${location.hostname} won't be auto-translated`);
+        } catch (e) {
+            showToast('Could not save the site preference', true);
+        }
+    });
+
+    el.addEventListener('mouseenter', () => {
+        widgetHovered = true;
+        clearTimeout(widgetMinimizeTimer);
+        clearTimeout(widgetHideTimer);
+        if (widgetState === 'progress') expandWidgetBox();
+    });
+    el.addEventListener('mouseleave', () => {
+        widgetHovered = false;
+        // Any hover-then-leave counts as user interaction, so it always gets
+        // the short delay - only a completely untouched widget waits the
+        // full 3s (that timer was already set once, at start, and is left
+        // alone here since it's still ticking).
+        if (widgetState === 'progress') scheduleMinimize(1000);
+        else if (widgetState === 'complete') scheduleHide(1500);
+    });
+
+    return el;
+}
+
+// delay is explicit so callers control the "no interaction yet" (3s, set
+// once at start) vs "user just hovered away" (1s) cases. Deliberately NOT
+// called from progress updates - only from start and from mouseleave -
+// otherwise a fast stream of progress ticks would keep resetting the clock
+// and the widget would never get a quiet window to minimize in.
+function scheduleMinimize(delay) {
+    clearTimeout(widgetMinimizeTimer);
+    if (widgetState !== 'progress') return;
+    widgetMinimizeTimer = setTimeout(() => {
+        if (!widgetHovered && widgetState === 'progress' && widgetEl) {
+            widgetEl.classList.remove('ltw-expanded');
+            widgetEl.classList.add('ltw-minimized');
+        }
+    }, delay);
+}
+
+// Only fires the actual hide if the user isn't still hovering; mouseleave
+// re-arms it once they move away.
+function scheduleHide(delay) {
+    clearTimeout(widgetHideTimer);
+    widgetHideTimer = setTimeout(() => {
+        if (widgetHovered) return;
+        if (widgetState === 'complete') hideWidget();
+    }, delay);
+}
+
+// Measures the pill's natural width from its actual text/button content.
+// Uses a real offscreen DOM element (not canvas measureText, which turned
+// out to under-measure - likely a system-ui font-string mismatch between
+// canvas and DOM rendering) so it matches exactly what the browser renders.
+let widgetMeasureRuler = null;
+function getMeasureRuler() {
+    if (widgetMeasureRuler) return widgetMeasureRuler;
+    const ruler = document.createElement('span');
+    // Without this, every text update here (many per second while translating)
+    // looks like new page content to the auto-translate MutationObserver, which
+    // queues it, translates it, writes the result back in - which is itself a
+    // mutation, re-triggering the loop forever. Same marker the widget itself
+    // uses to stay invisible to that pipeline.
+    ruler.setAttribute('translate', 'no');
+    ruler.style.cssText = 'position:fixed;left:-9999px;top:-9999px;visibility:hidden;' +
+        'white-space:nowrap;font-family:system-ui,-apple-system,sans-serif;font-size:13px;font-weight:600;';
+    document.body.appendChild(ruler);
+    widgetMeasureRuler = ruler;
+    return ruler;
+}
+const WIDGET_MAX_WIDTH = 300;
+
+function measureTextWidth(text) {
+    const ruler = getMeasureRuler();
+    ruler.textContent = text;
+    return ruler.getBoundingClientRect().width;
+}
+
+function measureContentWidth(el) {
+    const messageWidth = measureTextWidth(el.querySelector('.ltw-message').textContent);
+
+    const actionsEl = el.querySelector('.ltw-actions');
+    let actionsWidth = 0;
+    let gap = 0;
+    if (!actionsEl.hidden) {
+        actionsWidth = actionsEl.getBoundingClientRect().width;
+        gap = 8;
     }
 
-    statusEl.style.backgroundColor = isError ? '#E67E80' : '#A7C080';
-    statusEl.style.color = '#1E2326';
-    statusEl.textContent = message;
-    statusEl.style.opacity = '1';
-    statusEl.style.transform = 'translateY(0)';
+    const horizontalPadding = 12 + 8; // .ltw-content: 8px 8px 8px 12px
+    const total = horizontalPadding + messageWidth + gap + actionsWidth + 4; // small safety buffer
+    return Math.max(120, Math.min(WIDGET_MAX_WIDTH, Math.ceil(total)));
+}
+
+// Appends each clause only if the result still fits the pill's max width -
+// a clause that doesn't fit is dropped whole rather than left for CSS to
+// chop off mid-word. Clauses should be passed most-important first.
+function appendFittingClauses(base, clauses) {
+    let msg = base;
+    for (const clause of clauses) {
+        const candidate = msg + clause;
+        const width = 20 + measureTextWidth(candidate) + 4; // .ltw-content horizontal padding + buffer
+        if (width <= WIDGET_MAX_WIDTH) msg = candidate;
+    }
+    return msg;
+}
+
+// Does NOT touch widgetMinimizeTimer - resizing the box for new text
+// shouldn't disturb an already-running minimize countdown. Only actual
+// hover interaction (mouseenter) or a fresh start should reset that clock.
+function expandWidgetBox() {
+    if (!widgetEl) return;
+    // Only a genuine morph-open (from the minimized circle) gets the slow
+    // "stretch" animation; a resize of an already-open box (new/longer text)
+    // snaps near-instantly so text is never sitting truncated mid-transition.
+    const isMorphOpen = widgetEl.classList.contains('ltw-minimized');
+    widgetEl.style.setProperty('--ltw-width-duration', isMorphOpen ? '0.35s' : '0.08s');
+    widgetEl.style.setProperty('--ltw-expanded-width', measureContentWidth(widgetEl) + 'px');
+    widgetEl.classList.remove('ltw-minimized');
+    widgetEl.classList.add('ltw-expanded');
 }
 
 /**
- * Hide status indicator
+ * Show the pill and start the minimize timer.
+ * Pass auto:true for translations started without the user directly asking.
  */
-function hideStatus() {
-    const statusEl = document.getElementById('llm-translator-status');
-    if (statusEl) {
-        statusEl.style.opacity = '0';
-        statusEl.style.transform = 'translateY(20px)';
-        setTimeout(() => statusEl.remove(), 300);
+function startProgressWidget({ auto = false, message = '' } = {}) {
+    const el = getWidget();
+    clearTimeout(widgetHideTimer);
+    widgetState = 'progress';
+    el.classList.remove('ltw-error');
+    el.classList.add('ltw-visible');
+    el.style.setProperty('--ltw-pct', '0');
+
+    el.querySelector('.ltw-message').textContent = message;
+    el.querySelector('.ltw-mini-pct').textContent = '0%';
+    el.querySelector('.ltw-actions').hidden = false;
+    el.querySelector('.ltw-never').hidden = !auto;
+    expandWidgetBox();
+
+    // Untouched-widget case: exactly one 3s timer, set here and never reset
+    // by progress updates - see expandWidgetBox's comment.
+    if (!widgetHovered) scheduleMinimize(3000);
+}
+
+function updateProgressWidget(percent, message) {
+    if (!widgetEl || widgetState !== 'progress') return;
+    const pct = Math.max(0, Math.min(100, Math.round(percent)));
+    widgetEl.style.setProperty('--ltw-pct', String(pct));
+    widgetEl.querySelector('.ltw-mini-pct').textContent = pct + '%';
+    if (message !== undefined) {
+        widgetEl.querySelector('.ltw-message').textContent = message;
+        // Resizes for the new text without touching the minimize countdown -
+        // see expandWidgetBox's comment.
+        if (!widgetEl.classList.contains('ltw-minimized')) expandWidgetBox();
     }
+}
+
+/**
+ * Show the final result, forcing the pill back open so the user sees it,
+ * then fade the whole widget out after a delay (unless the user is hovering).
+ */
+function completeWidget(message, isError = false) {
+    const el = getWidget();
+    clearTimeout(widgetMinimizeTimer);
+    widgetState = 'complete';
+    el.classList.toggle('ltw-error', isError);
+    el.classList.add('ltw-visible');
+    el.querySelector('.ltw-message').textContent = message;
+    el.querySelector('.ltw-actions').hidden = true;
+    expandWidgetBox();
+    scheduleHide(isError ? 5000 : 4000);
+}
+
+function hideWidget() {
+    clearTimeout(widgetMinimizeTimer);
+    clearTimeout(widgetHideTimer);
+    widgetState = 'idle';
+    // Without this, a mouse that's sitting still over the widget's screen
+    // position when it hides never fires a fresh mouseleave/mouseenter pair,
+    // so the stale "hovered" flag survives into the next run and blocks
+    // both scheduleMinimize (start) and scheduleHide (complete) from firing.
+    widgetHovered = false;
+    if (widgetEl) widgetEl.classList.remove('ltw-visible', 'ltw-minimized', 'ltw-expanded');
+}
+
+/** A short one-off message with no stop button. */
+function showToast(message, isError = false) {
+    const el = getWidget();
+    clearTimeout(widgetMinimizeTimer);
+    widgetState = 'complete';
+    el.classList.toggle('ltw-error', isError);
+    el.classList.add('ltw-visible');
+    el.querySelector('.ltw-actions').hidden = true;
+    el.querySelector('.ltw-message').textContent = message;
+    expandWidgetBox();
+    scheduleHide(isError ? 4000 : 2500);
+}
+
+/** Stop button handler: just cancel remaining work. Already-translated text
+ * (even from an auto-triggered run) is left as-is. Pass silent:true when the
+ * caller is about to show its own, more specific completion message. */
+function stopCurrentTranslation({ silent = false } = {}) {
+    translationCancelled = true;
+    translationGeneration++;
+    suppressCancelMessage = silent;
+    pendingTranslationQueue = [];
+    stopAutoTranslate();
+    browserAPI.runtime.sendMessage({ type: 'CANCEL_TRANSLATION' }).catch(() => {});
+}
+
+// LM Studio JIT-loads models on the first request, which can take a while
+// and would otherwise leave the widget looking frozen at "0%" with no
+// requests yet answered. This only *observes* the load state via polling and
+// updates the widget accordingly - it never triggers a load itself, so it
+// must be started alongside (not before) the actual translation requests,
+// which are what cause LM Studio to load the model. No-ops for Ollama/older
+// LM Studio, since GET_MODEL_STATE reports state: null there.
+//
+// onReady fires the instant "loaded" is observed, so the caller can switch
+// the widget straight to its normal progress text instead of leaving
+// "Loading model..." stuck on screen until the next unrelated widget update
+// (which might not happen until the first translation batch finishes,
+// seconds later). Returns a stop() function; call it once real responses
+// start arriving, so this doesn't keep polling for the rest of the run.
+function watchModelLoading(onReady) {
+    let stopped = false;
+    const maxWaitMs = 180000; // safety cap so a stuck/unknown state never polls forever
+    const startedAt = Date.now();
+    (async () => {
+        try {
+            while (!stopped && !translationCancelled && Date.now() - startedAt < maxWaitMs) {
+                const res = await browserAPI.runtime.sendMessage({ type: 'GET_MODEL_STATE' });
+                if (stopped) return;
+                if (!res || !res.state || res.state === 'loaded') {
+                    if (onReady) onReady();
+                    return;
+                }
+                updateProgressWidget(0, 'Loading model...');
+                await new Promise(r => setTimeout(r, 300));
+            }
+        } catch (e) {
+            // Background worker unreachable or message type unsupported - just stop watching.
+        }
+    })();
+    return () => { stopped = true; };
 }
 
 /**
@@ -716,12 +931,67 @@ function getPageLanguage() {
     return getDeclaredPageLanguage() || 'en'; // Default fallback for translation source
 }
 
+// ============================================================================
+// Auto-translate on page load
+//
+// Opt-in (settings.autoTranslatePages). Only runs when the page *declares* a
+// language different from the target one — guessing would mean burning local
+// inference on pages that are already readable, so an undeclared page is left
+// alone. Two escape hatches are offered on the page itself while it runs.
+// ============================================================================
+
+let autoTranslateChecked = false;
+
+// A never-list entry covers its own host and any subdomain, so "example.com"
+// also matches "news.example.com".
+function hostMatchesNeverSite(hostname, sites) {
+    const host = (hostname || '').toLowerCase();
+    if (!host || !Array.isArray(sites)) return false;
+    return sites.some(entry => {
+        const site = String(entry || '').trim().toLowerCase();
+        if (!site) return false;
+        return host === site || host.endsWith('.' + site);
+    });
+}
+
+// Decide whether this page should be translated without the user asking, and
+// do it. Safe to call more than once — only the first call is acted on.
+async function maybeAutoTranslatePage(settings) {
+    if (autoTranslateChecked) return;
+    autoTranslateChecked = true;
+
+    if (!settings || !settings.autoTranslatePages) return;
+    // Top-level documents only. Translating every ad and widget iframe on a page
+    // would multiply the request count for text the user mostly cannot see.
+    if (window.top !== window.self) return;
+    if (translationInProgress) return;
+
+    const pageLang = getDeclaredPageLanguage();
+    if (!pageLang) return;
+
+    const target = String(settings.targetLanguage || currentTargetLanguage || 'en')
+        .split('-')[0].toLowerCase();
+    if (pageLang === target) return;
+
+    const neverLangs = Array.isArray(settings.autoTranslateNeverLanguages)
+        ? settings.autoTranslateNeverLanguages
+        : [];
+    if (neverLangs.includes(pageLang)) return;
+
+    if (hostMatchesNeverSite(location.hostname, settings.autoTranslateNeverSites)) return;
+
+    debugLog(`[Translator] Auto-translating page from ${pageLang} to ${target}`);
+    await translatePage(target, pageLang, true, { auto: true });
+}
+
 /**
  * Translate a batch of text items with retry logic
  * Returns { applied: number, failed: Array } 
  */
 async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto', retries = 3) {
     if (textItems.length === 0) return { applied: 0, failed: [] };
+    const generation = translationGeneration;
+    const cancelledResult = { applied: 0, failed: [], fromCache: 0, total: textItems.length, cacheActive: false };
 
     debugLog(`[Translator] translateBatch called for ${textItems.length} items:`, textItems);
 
@@ -732,6 +1002,7 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
 
     let lastError = null;
     for (let attempt = 0; attempt < retries; attempt++) {
+        if (generation !== translationGeneration) return cancelledResult;
         try {
             if (attempt > 0) {
                 debugLog(`[Translator] Retrying batch, attempt ${attempt + 1}/${retries}`);
@@ -742,6 +1013,7 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
                 targetLanguage,
                 sourceLanguage: pageLanguage // Pass detected page language for TranslateGemma
             });
+            if (generation !== translationGeneration) return cancelledResult;
 
             debugLog(`[Translator] translateBatch response:`, response);
 
@@ -799,6 +1071,7 @@ async function translateBatch(textItems, targetLanguage, sourceLanguage = 'auto'
             };
 
         } catch (e) {
+            if (generation !== translationGeneration) return cancelledResult;
             lastError = e;
             console.warn(`[Translator] Attempt ${attempt + 1}/${retries} failed:`, e.message);
             debugWarn(`[Translator] Batch translation failed with exception:`, e, 'on items:', textItems);
@@ -833,28 +1106,29 @@ function onScroll() {
 /**
  * Main translation function with queue and cancellation support
  */
-async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAutoTranslate = true) {
+async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAutoTranslate = true, { auto = false } = {}) {
     if (translationInProgress) {
-        showStatus('Translation already in progress...', true);
-        setTimeout(hideStatus, 2000);
+        showToast('Translation already in progress...', true);
         return;
     }
 
     currentTargetLanguage = targetLanguage;
     translationInProgress = true;
     translationCancelled = false;
-    showStatus('Extracting text...');
+    suppressCancelMessage = false;
+    const verb = auto ? 'Auto-translating' : 'Translating';
+    startProgressWidget({ auto, message: 'Extracting text...' });
 
     // Add scroll listener for dynamic priority
     window.addEventListener('scroll', onScroll, { passive: true });
     const stopKeepAlive = startKeepAlive();
+    let stopModelWatch = null;
 
     try {
         const textItems = extractTextNodes();
 
         if (textItems.length === 0) {
-            showStatus('No translatable text found', true);
-            setTimeout(hideStatus, 3000);
+            completeWidget('No translatable text found', true);
             translationInProgress = false;
             return;
         }
@@ -862,7 +1136,7 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
         // Initialize queue with all items (already sorted by priority)
         pendingTranslationQueue = [...textItems];
 
-        showStatus(`Found ${textItems.length} text elements. Translating...`);
+        updateProgressWidget(0, `Found ${textItems.length} text elements. ${verb}...`);
 
         let totalApplied = 0;
         let totalProcessed = 0; // Track how many items we've attempted
@@ -872,6 +1146,13 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
         const batchSize = 8; // Process in batches
         const failedItems = []; // Track items that failed for potential retry
         let inFlightBatches = []; // Track in-flight batch promises
+
+        // Started alongside (not before) the real requests below - LM Studio
+        // only starts loading once one of those requests actually lands.
+        stopModelWatch = watchModelLoading(() => {
+            const percent = Math.min(100, Math.round((totalProcessed / totalItems) * 100));
+            updateProgressWidget(percent, `${verb} ${percent}%`);
+        });
 
         // Main translation loop with parallel processing
         while ((pendingTranslationQueue.length > 0 || inFlightBatches.length > 0) && !translationCancelled) {
@@ -891,11 +1172,12 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
 
             // Cap percentage at 100%
             const percent = Math.min(100, Math.round((totalProcessed / totalItems) * 100));
-            showStatus(`Translating... ${percent}%`);
+            updateProgressWidget(percent, `${verb} ${percent}%`);
 
             // Wait for any one batch to complete
             if (inFlightBatches.length > 0) {
                 const completed = await Promise.race(inFlightBatches.map(b => b.promise));
+                stopModelWatch(); // a response landed, so the model is answering - stop polling its load state
 
                 // Remove the completed batch from inFlightBatches by its ID
                 inFlightBatches = inFlightBatches.filter(b => b.batchId !== completed.batchId);
@@ -915,55 +1197,47 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
 
             // Check cancellation between batches
             if (translationCancelled) {
-                showStatus('Translation cancelled');
-                setTimeout(hideStatus, 2000);
+                if (!suppressCancelMessage) completeWidget('Translation cancelled');
                 break;
             }
         }
 
-        if (!translationCancelled) {
-            // Show completion message with stats
-            const successRate = Math.round((totalApplied / totalItems) * 100);
-            let statusMsg = `Translated ${totalApplied}/${totalItems} elements (${successRate}%)`;
+        // Whatever got applied before a cancel is real, translated text sitting
+        // in the page - the popup's "Original" toggle needs to know about it
+        // regardless of whether the run finished or was cut short.
+        if (totalApplied > 0) {
+            hasTranslationCache = true;
+            isShowingTranslations = true;
+        }
 
+        if (!translationCancelled) {
             if (failedItems.length > 0) {
                 console.warn(`[Translator] ${failedItems.length} items failed:`,
                     failedItems.slice(0, 5).map(f => f.text.substring(0, 30)));
-                statusMsg += ` - ${failedItems.length} failed`;
             }
 
-            // If the cache was active and served some entries, tell the user
-            if (cacheActive && totalFromCache > 0 && totalItems > 0) {
-                const cachePercent = Math.round((totalFromCache / totalItems) * 100);
-                statusMsg += ` - ${cachePercent}% from cache`;
-            }
+            if (enableAutoTranslate) startAutoTranslate(targetLanguage);
 
-            // Mark that we have cached translations for toggle
-            if (totalApplied > 0) {
-                hasTranslationCache = true;
-                isShowingTranslations = true;
-            }
+            // The core "did it work" stat always shows; everything after is a
+            // nice-to-have that gets dropped whole (not truncated mid-word) if
+            // it doesn't fit the pill - most important clause first.
+            const cachePercent = (cacheActive && totalFromCache > 0 && totalItems > 0)
+                ? Math.round((totalFromCache / totalItems) * 100) : 0;
+            const statusMsg = appendFittingClauses(`Translated ${totalApplied}/${totalItems} elements`, [
+                failedItems.length > 0 ? `, ${failedItems.length} failed` : '',
+                cachePercent > 0 ? `, ${cachePercent}% cached` : '',
+                enableAutoTranslate ? ' · auto-on' : ''
+            ].filter(Boolean));
 
-            showStatus(statusMsg);
-
-            // Start auto-translate for new content if enabled
-            if (enableAutoTranslate) {
-                startAutoTranslate(targetLanguage);
-                setTimeout(() => {
-                    showStatus(`${statusMsg}. Auto-translate ON`);
-                    setTimeout(hideStatus, 4000);
-                }, 1000);
-            } else {
-                setTimeout(hideStatus, 4000);
-            }
+            completeWidget(statusMsg);
         }
 
     } catch (e) {
         console.error('Translation error:', e);
-        showStatus(`Error: ${e.message}`, true);
-        setTimeout(hideStatus, 5000);
+        completeWidget(`Error: ${e.message}`, true);
     } finally {
         stopKeepAlive();
+        if (stopModelWatch) stopModelWatch();
         translationInProgress = false;
         translationCancelled = false;
         pendingTranslationQueue = [];
@@ -1064,75 +1338,28 @@ async function translatePendingNodes() {
     if (textItems.length === 0) return;
 
     translationInProgress = true;
-    showStatus(`Translating ${textItems.length} new elements...`);
+    showToast(`Translating ${textItems.length} new elements...`);
 
     try {
         const result = await translateBatch(textItems, currentTargetLanguage);
-        showStatus(`Translated ${result.applied} new elements`);
-        setTimeout(hideStatus, 2000);
+        showToast(`Translated ${result.applied} new elements`);
     } catch (e) {
         console.error('Auto-translate error:', e);
-        showStatus(`Auto-translate error: ${e.message}`, true);
-        setTimeout(hideStatus, 3000);
+        showToast(`Auto-translate error: ${e.message}`, true);
     } finally {
         translationInProgress = false;
     }
 }
 
-// A closed accordion was intentionally skipped during initial extraction. Once
-// opened, translate just that section instead of restarting the whole page.
-function queueOpenedDetails(details) {
-    if (!details || !details.open || !hasTranslationCache) return;
-    openedDetailsToTranslate.add(details);
-    if (openedDetailsTimer) clearTimeout(openedDetailsTimer);
-    openedDetailsTimer = setTimeout(translateOpenedDetails, 150);
-}
-
-async function translateOpenedDetails() {
-    openedDetailsTimer = null;
-    if (!openedDetailsToTranslate.size) return;
+async function translateSelection(targetLanguage, sourceLanguage = 'auto') {
     if (translationInProgress) {
-        openedDetailsTimer = setTimeout(translateOpenedDetails, 250);
-        return;
-    }
-
-    const details = [...openedDetailsToTranslate].filter(item => item.isConnected && item.open);
-    openedDetailsToTranslate.clear();
-    if (!details.length) return;
-
-    const textItems = [];
-    for (const item of details) textItems.push(...extractTextNodes(item, true));
-    if (!textItems.length) return;
-
-    translationInProgress = true;
-    showStatus(`Translating ${textItems.length} expanded elements...`);
-    try {
-        const result = await translateBatch(textItems, currentTargetLanguage);
-        showStatus(`Translated ${result.applied}/${textItems.length} expanded elements`);
-        setTimeout(hideStatus, 2000);
-    } catch (e) {
-        console.error('Expanded section translation error:', e);
-        showStatus(`Expanded section error: ${e.message}`, true);
-        setTimeout(hideStatus, 3000);
-    } finally {
-        translationInProgress = false;
-        if (openedDetailsToTranslate.size && !openedDetailsTimer) {
-            openedDetailsTimer = setTimeout(translateOpenedDetails, 0);
-        }
-    }
-}
-
-async function translateSelection(targetLanguage, sourceLanguage = 'auto', forceFresh = false) {
-    if (translationInProgress) {
-        showStatus('Translation already in progress...', true);
-        setTimeout(hideStatus, 2000);
+        showToast('Translation already in progress...', true);
         return;
     }
 
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
-        showStatus('No text selected', true);
-        setTimeout(hideStatus, 2000);
+        showToast('No text selected', true);
         return;
     }
 
@@ -1140,34 +1367,37 @@ async function translateSelection(targetLanguage, sourceLanguage = 'auto', force
     translationInProgress = true;
     translationCancelled = false;
     const stopKeepAlive = startKeepAlive();
-    showStatus('Extracting selected text...');
+    let stopModelWatch = null;
+    startProgressWidget({ message: 'Extracting selected text...' });
 
     try {
         const textItems = extractSelectionTextNodes(selection);
 
         if (textItems.length === 0) {
-            showStatus('No translatable text in selection', true);
-            setTimeout(hideStatus, 3000);
+            completeWidget('No translatable text in selection', true);
             return;
         }
 
-        if (forceFresh) {
-            await clearCacheForTextItems(textItems, targetLanguage, sourceLanguage);
-        }
-
-        showStatus(`${forceFresh ? 'Retranslating' : 'Translating'} ${textItems.length} selected elements...`);
+        updateProgressWidget(0, `Translating ${textItems.length} selected elements...`);
 
         let totalApplied = 0;
         const batchSize = 8;
         const failedItems = [];
 
+        // Started alongside (not before) the real requests below - LM Studio
+        // only starts loading once one of those requests actually lands.
+        stopModelWatch = watchModelLoading(() => {
+            updateProgressWidget(0, `Translating ${textItems.length} selected elements...`);
+        });
+
         for (let i = 0; i < textItems.length && !translationCancelled; i += batchSize) {
             const batch = textItems.slice(i, i + batchSize);
             const result = await translateBatch(batch, targetLanguage, sourceLanguage);
+            stopModelWatch(); // a response landed, so the model is answering - stop polling its load state
             totalApplied += result.applied;
             if (result.failed && result.failed.length > 0) failedItems.push(...result.failed);
             const percent = Math.min(100, Math.round(((i + batch.length) / textItems.length) * 100));
-            showStatus(`${forceFresh ? 'Retranslating' : 'Translating'} selection... ${percent}%`);
+            updateProgressWidget(percent, `Translating selection ${percent}%`);
         }
 
         if (totalApplied > 0) {
@@ -1175,72 +1405,24 @@ async function translateSelection(targetLanguage, sourceLanguage = 'auto', force
             isShowingTranslations = true;
         }
 
-        let statusMsg = `${forceFresh ? 'Retranslated' : 'Translated'} ${totalApplied}/${textItems.length} selected elements`;
+        let statusMsg = translationCancelled
+            ? `Translation cancelled - ${totalApplied}/${textItems.length} selected elements translated`
+            : `Translated ${totalApplied}/${textItems.length} selected elements`;
         if (failedItems.length > 0) statusMsg += ` - ${failedItems.length} failed`;
-        showStatus(statusMsg);
-        setTimeout(hideStatus, 4000);
+        completeWidget(statusMsg);
 
     } catch (e) {
         console.error('[Translator] Selection translation error:', e);
-        showStatus(`Error: ${e.message}`, true);
-        setTimeout(hideStatus, 5000);
+        completeWidget(`Error: ${e.message}`, true);
     } finally {
         stopKeepAlive();
+        if (stopModelWatch) stopModelWatch();
         translationInProgress = false;
         translationCancelled = false;
         // Suppress the button briefly so it doesn't reappear on the now-translated selection
         suppressFloatingBtn = true;
         setTimeout(() => { suppressFloatingBtn = false; }, 1000);
     }
-}
-
-async function discardSelectedTranslation(targetLanguage, sourceLanguage = 'auto') {
-    if (translationInProgress) {
-        showStatus('Translation already in progress...', true);
-        return { ok: false, error: 'Translation already in progress' };
-    }
-
-    const selection = window.getSelection();
-    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
-        showStatus('No text selected', true);
-        setTimeout(hideStatus, 2000);
-        return { ok: false, error: 'No text selected' };
-    }
-
-    try {
-        const textItems = extractSelectionTextNodes(selection);
-        if (textItems.length === 0) {
-            showStatus('No translated text in selection', true);
-            setTimeout(hideStatus, 3000);
-            return { ok: false, error: 'No translated text in selection' };
-        }
-
-        const removed = await clearCacheForTextItems(textItems, targetLanguage, sourceLanguage);
-        const restored = resetSegmentsToOriginal(textItems.map(item => item.id));
-        showStatus(`Discarded ${textItems.length} selected translation histories`);
-        setTimeout(hideStatus, 3000);
-        return { ok: true, restored, cacheRemoved: removed };
-    } catch (e) {
-        console.error('[Translator] Discard selected translation error:', e);
-        showStatus(`Error: ${e.message}`, true);
-        setTimeout(hideStatus, 5000);
-        return { ok: false, error: e.message };
-    }
-}
-
-// Return the original source segments behind the current selection. This lets
-// the popup prefill a glossary entry even after the page text was replaced by a
-// translation. The input remains editable because a selected sentence is often
-// narrowed to a shorter term before saving.
-function getSelectedGlossaryContext() {
-    const selection = window.getSelection();
-    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
-        return { ok: false, error: 'No text selected' };
-    }
-    const items = extractSelectionTextNodes(selection);
-    const sources = [...new Set(items.map(item => item.text.trim()).filter(Boolean))];
-    if (!sources.length) return { ok: false, error: 'No translatable text in selection' };
-    return { ok: true, source: sources.join(' '), segments: sources.length };
 }
 
 // Listen for messages from background/popup
@@ -1251,7 +1433,7 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'START_TRANSLATION':
             if (message.showGlow !== undefined) showGlow = message.showGlow;
             if (message.maxConcurrentRequests !== undefined) {
-                maxConcurrentRequests = Math.max(1, Math.min(4, message.maxConcurrentRequests));
+                maxConcurrentRequests = Math.max(1, Math.min(32, message.maxConcurrentRequests));
             }
             translatePage(message.targetLanguage, message.sourceLanguage, true);
             sendResponse({ started: true });
@@ -1260,29 +1442,11 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'TRANSLATE_SELECTION':
             if (message.showGlow !== undefined) showGlow = message.showGlow;
             if (message.maxConcurrentRequests !== undefined) {
-                maxConcurrentRequests = Math.max(1, Math.min(4, message.maxConcurrentRequests));
+                maxConcurrentRequests = Math.max(1, Math.min(32, message.maxConcurrentRequests));
             }
             translateSelection(message.targetLanguage, message.sourceLanguage);
             sendResponse({ started: true });
             break;
-
-        case 'RETRANSLATE_SELECTION':
-            if (message.showGlow !== undefined) showGlow = message.showGlow;
-            if (message.maxConcurrentRequests !== undefined) {
-                maxConcurrentRequests = Math.max(1, Math.min(4, message.maxConcurrentRequests));
-            }
-            translateSelection(message.targetLanguage, message.sourceLanguage, true);
-            sendResponse({ started: true });
-            break;
-
-        case 'DISCARD_SELECTION_TRANSLATION':
-            discardSelectedTranslation(message.targetLanguage || currentTargetLanguage, message.sourceLanguage)
-                .then(sendResponse);
-            return true;
-
-        case 'GET_SELECTION_GLOSSARY_CONTEXT':
-            sendResponse(getSelectedGlossaryContext());
-            return false;
 
         case 'SET_GLOW':
             showGlow = message.enabled;
@@ -1295,8 +1459,7 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         case 'RESTORE_ORIGINAL':
             restoreOriginalText();
-            showStatus('Restored original text');
-            setTimeout(hideStatus, 2000);
+            showToast('Restored original text');
             sendResponse({ restored: true, hasCache: hasTranslationCache });
             break;
 
@@ -1304,13 +1467,11 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
             // Toggle between translated and original
             if (isShowingTranslations) {
                 restoreOriginalText();
-                showStatus('Showing original text');
-                setTimeout(hideStatus, 2000);
+                showToast('Showing original text');
                 sendResponse({ showing: 'original', hasCache: hasTranslationCache });
             } else if (hasTranslationCache) {
                 restoreCachedTranslations();
-                showStatus('Restored translations');
-                setTimeout(hideStatus, 2000);
+                showToast('Restored translations');
                 sendResponse({ showing: 'translated', hasCache: hasTranslationCache });
             } else {
                 sendResponse({ showing: 'original', hasCache: false });
@@ -1318,7 +1479,7 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
             break;
 
         case 'TRANSLATION_PROGRESS':
-            showStatus(message.status);
+            showToast(message.status);
             sendResponse({ received: true });
             break;
 
@@ -1339,20 +1500,17 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'TOGGLE_AUTO_TRANSLATE':
             if (autoTranslateEnabled) {
                 stopAutoTranslate();
-                showStatus('Auto-translate disabled');
+                showToast('Auto-translate disabled');
             } else {
                 startAutoTranslate(message.targetLanguage || currentTargetLanguage);
-                showStatus('Auto-translate enabled');
+                showToast('Auto-translate enabled');
             }
-            setTimeout(hideStatus, 2000);
             sendResponse({ autoTranslate: autoTranslateEnabled });
             break;
 
         case 'CANCEL_TRANSLATION':
             console.log('[Translator] Cancellation requested');
-            translationCancelled = true;
-            pendingTranslationQueue = [];
-            stopAutoTranslate();
+            stopCurrentTranslation();
             sendResponse({ cancelled: true });
             break;
 
@@ -1486,20 +1644,13 @@ document.addEventListener('selectionchange', () => {
     }
 });
 
-// `toggle` is dispatched by <details> after its open state changes. Capture it
-// so this also works on sites where the event is not bubbled by a framework.
-document.addEventListener('toggle', (event) => {
-    if (event.target instanceof HTMLDetailsElement) queueOpenedDetails(event.target);
-}, true);
-
 window.addEventListener('scroll', () => {
     if (floatingTranslateBtn && floatingTranslateBtn.style.display !== 'none') hideFloatingBtn();
 }, { passive: true });
 
-// Page is navigating away / unloading — tell the background to abort this tab's
-// in-flight LLM requests so they don't run to the 5min timeout. Fire-and-forget:
-// the document is being torn down, so we can't await a response.
+// A page that goes away cannot use its pending translations. Release the
+// server request instead of leaving it to run until the timeout.
 window.addEventListener('pagehide', () => {
     if (!translationInProgress) return;
-    try { browserAPI.runtime.sendMessage({ type: 'CANCEL_TRANSLATION' }); } catch (e) {}
+    browserAPI.runtime.sendMessage({ type: 'CANCEL_TRANSLATION' }).catch(() => {});
 });

@@ -17,7 +17,7 @@
  *
  * Loaded in the background context (service worker on Chrome, event-page script
  * on Firefox). Exposes its API on the global object: cacheKey, cacheGetMany,
- * cacheSetMany, cacheClear, cacheCount, cacheDeleteKeys.
+ * cacheSetMany, cacheClear, cacheCount.
  */
 (function () {
     const DB_NAME = 'llm-translator-cache';
@@ -131,34 +131,6 @@
         });
     }
 
-    // Delete specific keys from both layers. Resolves with how many entries were
-    // actually removed (IndexedDB count when available, since memory is a subset).
-    // Never rejects — an IndexedDB failure leaves the memory deletions in place.
-    function cacheDeleteKeys(keys) {
-        if (!keys || keys.length === 0) return Promise.resolve(0);
-        let memRemoved = 0;
-        for (const k of keys) if (mem.delete(k)) memRemoved++;
-        if (idbDisabled) return Promise.resolve(memRemoved);
-        return openDB().then(db => new Promise((resolve) => {
-            const store = db.transaction(STORE, 'readwrite').objectStore(STORE);
-            let idbRemoved = 0;
-            let remaining = keys.length;
-            const done = () => { if (--remaining === 0) resolve(idbRemoved); };
-            keys.forEach((k) => {
-                const g = store.get(k);
-                g.onsuccess = () => {
-                    if (g.result) { idbRemoved++; store.delete(k); }
-                    done();
-                };
-                g.onerror = () => done();
-            });
-        })).then((idbRemoved) => {
-            const removed = Math.max(memRemoved, idbRemoved);
-            if (approxCount !== null) approxCount = Math.max(0, approxCount - removed);
-            return removed;
-        }).catch(() => memRemoved);
-    }
-
     function cacheClear() {
         mem.clear();
         if (idbDisabled) return Promise.resolve();
@@ -191,5 +163,5 @@
 
     const g = (typeof self !== 'undefined') ? self
         : (typeof globalThis !== 'undefined') ? globalThis : window;
-    Object.assign(g, { cacheKey, cacheGetMany, cacheSetMany, cacheClear, cacheCount, cachePersistentAvailable, cacheDeleteKeys });
+    Object.assign(g, { cacheKey, cacheGetMany, cacheSetMany, cacheClear, cacheCount, cachePersistentAvailable });
 })();
